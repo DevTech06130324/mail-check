@@ -709,6 +709,13 @@ def test_action_queue(msgs):
               "%d labels for %d cards" % (labels, articles))
         check("  and it is labelled for screen readers",
               '<span class="sr-only">Account: </span>gmail' in faces)
+        # Grouped with the date as envelope metadata, not mixed in among the
+        # category and deadline pills, which are the model's verdict.
+        paired = len(re.findall(
+            r'<span class="meta">\s*<span class="acct">.*?</span>\s*'
+            r'<span class="when">', faces, flags=re.S))
+        check("  paired with the date, outside the verdict pills",
+              paired == articles, "%d paired for %d cards" % (paired, articles))
         check("  All mail too",
               'class="acct"' in strip_details(cards(client.get("/?view=all"))))
 

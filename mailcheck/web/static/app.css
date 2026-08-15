@@ -504,24 +504,30 @@ details.filters[open] > summary::after { content: "▴"; }
   font-weight: 650;
 }
 .mail .due.urgent { background: var(--act-bg); color: var(--act); }
-/* Neutral on purpose: the account is context for reading the card, not a
-   status, so it must not compete with the category and deadline pills. A long
-   label truncates rather than pushing the date onto its own line. */
+/* Envelope facts — which mailbox, and when — read as one quiet phrase at the
+   end of the row: "gmail · Yesterday". Kept as text rather than a third pill so
+   nothing competes with the category and deadline, which are the verdict. */
+.mail .meta {
+  margin-left: auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+/* A long label truncates rather than pushing the date onto its own line. */
 .mail .acct {
-  display: inline-block;
+  min-width: 0;
   max-width: 16ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  vertical-align: bottom;
-  padding: 2.5px 9px;
-  border-radius: 980px;
-  background: var(--surface-sunk);
-  color: var(--text-2);
-  font-size: 11.5px;
+  font-size: 12.5px;
   font-weight: 550;
+  color: var(--text-2);
 }
-.mail .when { margin-left: auto; font-size: 12.5px; color: var(--text-3); white-space: nowrap; }
+.mail .when { font-size: 12.5px; color: var(--text-3); white-space: nowrap; }
+/* Only a separator, and only when there is something to separate. */
+.mail .acct + .when::before { content: "·"; margin-right: 6px; }
 .mail .summary { margin: 6px 0 0; color: var(--text-2); overflow-wrap: anywhere; }
 
 .actions {
@@ -905,7 +911,10 @@ html, body { max-width: 100%; overflow-x: hidden; }
   .mail { padding: 13px 14px; }
   .mail .who { font-size: 15px; }
   .mail-top { gap: 7px; }
-  .mail .when { margin-left: 0; }
+  /* Too narrow to hold a right-hand column: let the metadata sit with the
+     pills rather than stranding itself against the edge on a line of its own. */
+  .mail .meta { margin-left: 0; }
+  .mail .acct { max-width: 12ch; }
   .actions { gap: 6px; }
   /* Primary actions stay visible; Details drops below rather than squeezing. */
   .actions .detail { margin-left: 0; width: 100%; }

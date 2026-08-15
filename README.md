@@ -92,10 +92,10 @@ mail-check config show | set llm.batch_size 4 | token | test
 Three pages, all of it local:
 
 - **Queue** (default) — only what needs you: unhandled interview invites, assessments,
-  offers, info requests and recruiter outreach. Each card leads with its category,
-  deadline and the account it arrived in, then company and role, then a one-line summary,
-  then two actions: **Open in Gmail/Outlook** and **Done**. Everything else is behind
-  Details.
+  offers, info requests and recruiter outreach. Each card leads with its category and
+  deadline, with the mailbox it arrived in and when, quietly, at the end of that line;
+  then company and role, then a one-line summary, then two actions: **Open in
+  Gmail/Outlook** and **Done**. Everything else is behind Details.
 - **All mail** — the same cards, every category, grouped by urgency.
 - **Completed** — what you've marked Done, with Restore.
 - **Accounts** — connect an IMAP mailbox with an app password, or sign in to a personal
