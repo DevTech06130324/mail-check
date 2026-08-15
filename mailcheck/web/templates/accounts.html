@@ -1,0 +1,365 @@
+{% extends "base.html" %}
+{% block title %}Accounts · mail-check{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <h1>Accounts</h1>
+  <p>Mailboxes are read-only. Nothing is ever marked as read, moved, or deleted.</p>
+</div>
+
+{% if accounts %}
+<div class="card">
+  {% for a in accounts %}
+  {# The label only ever flows through as a data attribute, read back via
+     .dataset in app.js — never interpolated into an inline JS string, which
+     an apostrophe or worse in a label could otherwise break out of. #}
+  <div class="row" data-label="{{ a.label }}">
+    <label class="switch">
+      <input type="checkbox" {% if a.enabled %}checked{% endif %}
+             aria-label="Include {{ a.label }} in checks" data-action="toggle">
+      <span class="track" aria-hidden="true"></span>
+    </label>
+    <div class="row-main">
+      <div class="row-title">
+        {{ a.label }}
+        <span class="tag">{{ 'Outlook' if a.provider == 'outlook' else 'IMAP' }}</span>
+      </div>
+      <div class="row-sub">
+        {{ a.email }}{% if a.provider != 'outlook' %} · {{ a.imap_host }} · {{ a.folder }}{% endif %}
+      </div>
+    </div>
+    <div class="row-actions">
+      <button class="btn sm" data-action="test">Test</button>
+      <button class="btn sm danger" data-action="remove">Remove</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty">
+  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+  </svg>
+  <h3>No mailboxes yet</h3>
+  <p>Connect an account below and mail-check will read its unread mail.</p>
+</div>
+{% endif %}
+
+<h2 style="margin:26px 0 12px">Add a mailbox</h2>
+<div class="providers">
+  <button class="provider" data-open="add-sheet">
+    <span class="p-icon" aria-hidden="true">✉︎</span>
+    <span class="p-main">
+      <span class="p-name">Gmail, Yahoo, iCloud, Fastmail…</span>
+      <span class="p-sub">Connect over IMAP with an app password</span>
+    </span>
+  </button>
+
+  <button class="provider" onclick="startOutlook()">
+    <span class="p-icon" aria-hidden="true">◱</span>
+    <span class="p-main">
+      <span class="p-name">Outlook.com, Hotmail, Live</span>
+      <span class="p-sub">
+        {% if outlook_ready %}Sign in with Microsoft — no password stored
+        {% else %}Needs a Microsoft client ID in Settings first{% endif %}
+      </span>
+    </span>
+  </button>
+</div>
+
+<div class="note" style="margin-top:18px">
+  <strong>Microsoft 365 work and school accounts are not supported.</strong>
+  Personal Outlook.com, Hotmail and Live accounts sign in with Microsoft directly and
+  use read-only <code>Mail.Read</code> permission — no mailbox password is stored.
+</div>
+
+<!-- ------------------------------------------------------------- IMAP sheet -->
+<div class="scrim" id="add-sheet" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="add-title">
+    <div class="sheet-head">
+      <h2 id="add-title">Add IMAP account</h2>
+      <p>The connection is tested before anything is saved.</p>
+    </div>
+    <form id="add-form" onsubmit="event.preventDefault(); saveAccount(document.getElementById('f-save'));">
+      <div class="sheet-body">
+        <div class="field">
+          <label for="f-email">Email address</label>
+          <input type="email" id="f-email" placeholder="you@gmail.com" oninput="detectPreset()"
+                 autocomplete="email" required>
+          <div class="hint" id="preset-note"></div>
+        </div>
+        <div class="field">
+          <label for="f-label">Label</label>
+          <input type="text" id="f-label" placeholder="gmail" required>
+          <div class="hint">A short nickname. It appears on each email so you can tell
+            your inboxes apart.</div>
+        </div>
+        <div class="field">
+          <label for="f-password">App password</label>
+          <input type="password" id="f-password" placeholder="abcd efgh ijkl mnop"
+                 autocomplete="current-password" required>
+          <div class="hint">Gmail: turn on 2-Step Verification, then create one at
+            <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener">
+            myaccount.google.com/apppasswords</a>. Spaces are fine — they're stripped for you.</div>
+        </div>
+        <details>
+          <summary style="cursor:pointer;font-size:13px;color:var(--text-2)">Server settings</summary>
+          <div style="margin-top:12px">
+            <div class="field-row">
+              <div class="field">
+                <label for="f-host">IMAP host</label>
+                <input type="text" id="f-host" placeholder="imap.gmail.com" required>
+              </div>
+              <div class="field" style="max-width:110px">
+                <label for="f-port">Port</label>
+                <input type="number" id="f-port" value="993">
+              </div>
+            </div>
+            <div class="field">
+              <label for="f-folder">Folder</label>
+              <input type="text" id="f-folder" value="INBOX">
+            </div>
+          </div>
+        </details>
+      </div>
+      <div class="sheet-foot">
+        <button type="button" class="btn" data-close="add-sheet">Cancel</button>
+        <button type="submit" class="btn primary" id="f-save" data-busy="Connecting…">
+          Test &amp; save
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ---------------------------------------------------------- Outlook sheet -->
+<!-- data-on-close: dismissing this dialog any way (Escape, clicking outside,
+     not just the Cancel button) must stop the pending sign-in, or it keeps
+     polling Microsoft in the background with no UI left to report to. -->
+<div class="scrim" id="outlook-sheet" data-on-close="cancelOutlook" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="ol-title">
+    <div class="sheet-head">
+      <h2 id="ol-title">Connect Outlook</h2>
+      <p id="ol-sub">Sign in with Microsoft. mail-check never sees your password.</p>
+    </div>
+
+    <form id="ol-form" onsubmit="event.preventDefault(); beginOutlook(document.getElementById('ol-go'));">
+      <div class="sheet-body">
+        <!-- 1. name it -->
+        <div id="ol-step-label">
+          <div class="field">
+            <label for="ol-label">Label</label>
+            <input type="text" id="ol-label" placeholder="outlook" value="outlook" required>
+            <div class="hint">A short nickname for this mailbox.</div>
+          </div>
+        </div>
+
+        <!-- 2. device code -->
+        <div id="ol-step-code" hidden>
+          <p class="hint" style="margin-bottom:10px">
+            Open the page below, enter this code, and approve read-only access to your mail.
+          </p>
+          <div class="code-box">
+            <code id="ol-code">—</code>
+            <button type="button" class="btn sm" onclick="copyCode()">Copy</button>
+          </div>
+          <a class="btn primary" id="ol-link" href="#" target="_blank" rel="noopener"
+             style="width:100%;margin-top:10px">Open Microsoft sign-in ↗</a>
+          <p class="hint" style="margin-top:10px">Waiting for you to finish signing in…</p>
+        </div>
+
+        <!-- 3. terminal states -->
+        <div id="ol-step-done" hidden>
+          <div class="note" id="ol-result"></div>
+        </div>
+      </div>
+
+      <div class="sheet-foot">
+        <button type="button" class="btn" id="ol-cancel" onclick="cancelOutlook()">Cancel</button>
+        <button type="submit" class="btn primary" id="ol-go" data-busy="Starting…">
+          Continue
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const OUTLOOK_READY = {{ 'true' if outlook_ready else 'false' }};
+
+/* --------------------------------------------------------------- IMAP flow */
+
+let presetTimer;
+function detectPreset() {
+  clearTimeout(presetTimer);
+  presetTimer = setTimeout(async () => {
+    const email = document.getElementById("f-email").value.trim();
+    const note = document.getElementById("preset-note");
+    if (!email.includes("@")) { note.textContent = ""; return; }
+    try {
+      const { preset } = await (await fetch("/api/preset?email=" + encodeURIComponent(email))).json();
+      if (!preset) { note.textContent = "Unknown provider — fill in Server settings below."; return; }
+      document.getElementById("f-host").value = preset.host;
+      document.getElementById("f-port").value = preset.port;
+      if (!document.getElementById("f-label").value) {
+        document.getElementById("f-label").value = preset.key;
+      }
+      note.textContent = preset.supported
+        ? `Detected ${preset.name}.`
+        : `${preset.name} — use the Outlook option instead; IMAP will not work.`;
+      note.style.color = preset.supported ? "" : "var(--act)";
+    } catch (e) { /* leave the fields for manual entry */ }
+  }, 350);
+}
+
+async function saveAccount(btn) {
+  const body = {
+    email: document.getElementById("f-email").value.trim(),
+    label: document.getElementById("f-label").value.trim(),
+    password: document.getElementById("f-password").value,
+    host: document.getElementById("f-host").value.trim(),
+    port: parseInt(document.getElementById("f-port").value, 10) || 993,
+    folder: document.getElementById("f-folder").value.trim() || "INBOX",
+    use_ssl: true,
+  };
+  if (!body.email || !body.label || !body.password || !body.host) {
+    toast("Email, label, password and IMAP host are all required.", false);
+    return;
+  }
+  await withBusy(btn, async () => {
+    try {
+      const r = await api("/api/accounts", body);
+      toast(r.message);
+      setTimeout(() => location.reload(), 700);
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+/* ------------------------------------------------------------ Outlook flow */
+
+let olPoll = null;
+
+function startOutlook() {
+  if (!OUTLOOK_READY) {
+    toast("Add a Microsoft application client ID under Settings first.", false);
+    setTimeout(() => (location.href = "/settings#outlook"), 1400);
+    return;
+  }
+  showOlStep("label");
+  openSheet("outlook-sheet");
+}
+
+function showOlStep(step) {
+  document.getElementById("ol-step-label").hidden = step !== "label";
+  document.getElementById("ol-step-code").hidden = step !== "code";
+  document.getElementById("ol-step-done").hidden = step !== "done";
+  const go = document.getElementById("ol-go");
+  go.hidden = step !== "label";
+  document.getElementById("ol-cancel").textContent = step === "done" ? "Close" : "Cancel";
+}
+
+async function beginOutlook(btn) {
+  const label = document.getElementById("ol-label").value.trim();
+  if (!label) { toast("Give the account a label first.", false); return; }
+  await withBusy(btn, async () => {
+    try {
+      const r = await api("/api/outlook/start", { label });
+      document.getElementById("ol-code").textContent = r.user_code;
+      document.getElementById("ol-link").href = r.verification_uri;
+      showOlStep("code");
+      window.open(r.verification_uri, "_blank", "noopener");
+      pollOutlook();
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+function pollOutlook() {
+  clearInterval(olPoll);
+  olPoll = setInterval(async () => {
+    let s;
+    try { s = await (await fetch("/api/outlook/status")).json(); }
+    catch (e) { return; }
+    if (s.state === "waiting") return;
+
+    clearInterval(olPoll);
+    const box = document.getElementById("ol-result");
+    if (s.state === "connected") {
+      box.textContent = s.message || "Connected.";
+      showOlStep("done");
+      toast(s.message || "Outlook connected.");
+      setTimeout(() => location.reload(), 1200);
+    } else if (s.state === "failed") {
+      box.textContent = s.message || "Sign-in failed.";
+      showOlStep("done");
+      toast(s.message || "Sign-in failed.", false);
+    }
+  }, 2000);
+}
+
+async function cancelOutlook() {
+  clearInterval(olPoll);
+  try { await api("/api/outlook/cancel"); } catch (e) { /* nothing pending */ }
+  closeSheet("outlook-sheet");
+}
+
+function copyCode() {
+  const code = document.getElementById("ol-code").textContent;
+  navigator.clipboard.writeText(code).then(
+    () => toast("Code copied."),
+    () => toast("Copy failed — type it manually.", false)
+  );
+}
+
+/* -------------------------------------------------------------- shared ops */
+
+async function testAccount(label, btn) {
+  await withBusy(btn, async () => {
+    try { toast((await api(`/api/accounts/${encodeURIComponent(label)}/test`)).message); }
+    catch (e) { toast(e.message, false); }
+  });
+}
+
+async function toggleAccount(label, el) {
+  try {
+    toast((await api(`/api/accounts/${encodeURIComponent(label)}/toggle?enabled=${el.checked}`)).message);
+  } catch (e) {
+    el.checked = !el.checked;   // put the switch back if the server refused
+    toast(e.message, false);
+  }
+}
+
+async function removeAccount(label) {
+  if (!confirm(`Remove “${label}”?\n\nIts stored credentials and cached mail are deleted. `
+             + `Your actual mailbox is untouched.`)) return;
+  try {
+    toast((await api(`/api/accounts/${encodeURIComponent(label)}/delete`)).message);
+    setTimeout(() => location.reload(), 700);
+  } catch (e) { toast(e.message, false); }
+}
+
+/* The label reaches these handlers only via the row's data-label attribute,
+   never re-embedded into an inline JS string — see the comment by the row
+   markup above. */
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-action]");
+  if (!el) return;
+  const row = el.closest("[data-label]");
+  if (!row) return;
+  const label = row.dataset.label;
+  if (el.dataset.action === "test") testAccount(label, el);
+  else if (el.dataset.action === "remove") removeAccount(label);
+});
+
+document.addEventListener("change", (e) => {
+  const el = e.target.closest('[data-action="toggle"]');
+  if (!el) return;
+  const row = el.closest("[data-label]");
+  if (!row) return;
+  toggleAccount(row.dataset.label, el);
+});
+</script>
+{% endblock %}

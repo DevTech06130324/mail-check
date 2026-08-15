@@ -1,0 +1,372 @@
+{% extends "base.html" %}
+{% block title %}Settings · mail-check{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <h1>Settings</h1>
+  <p>Stored locally. Your auth token lives in the OS keyring, never in a file.</p>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>Model</h2>
+    <p>Any OpenAI-compatible endpoint — OmniRoute, OpenRouter, or a local proxy.</p>
+  </div>
+  <div class="card-body">
+    <div class="field">
+      <label for="s-base">Base URL</label>
+      <input type="text" id="s-base" value="{{ cfg.llm.base_url }}"
+             placeholder="http://localhost:20128/v1">
+      <div class="hint">Usually ends in <code>/v1</code>. mail-check appends
+        <code>/chat/completions</code>.</div>
+    </div>
+    <div class="field">
+      <label for="s-model">Model</label>
+      <input type="text" id="s-model" value="{{ cfg.llm.model }}" placeholder="model-name">
+    </div>
+    <div class="field">
+      <label for="s-token">Auth token</label>
+      <input type="password" id="s-token"
+             placeholder="{{ '••••••••  (stored — leave blank to keep)' if has_token else 'Paste your token' }}">
+    </div>
+  </div>
+  <div class="row" style="justify-content:flex-end;gap:8px">
+    <button class="btn" id="s-test" data-busy="Testing…" onclick="testModel(this)">Test connection</button>
+    <button class="btn primary" data-busy="Saving…" onclick="saveSettings(this)">Save</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>Checking</h2>
+    <p>How much mail to read, and how hard to push the model.</p>
+  </div>
+
+  <div class="row">
+    <label class="switch">
+      <input type="checkbox" id="s-auto" {% if cfg.watch.auto_check %}checked{% endif %}
+             aria-label="Check automatically" onchange="toggleAuto(this.checked)">
+      <span class="track"></span>
+    </label>
+    <div class="row-main">
+      <div class="row-title">Check automatically</div>
+      <div class="row-sub" id="auto-sub">
+        {% if cfg.watch.auto_check %}
+          Running every {{ cfg.watch.interval_minutes }} minutes while this console is open.
+        {% else %}
+          Off — mail is only checked when you press Check now.
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <label class="switch">
+      <input type="checkbox" id="s-notify" aria-label="Browser notifications for urgent mail"
+             onchange="toggleBrowserNotify(this)">
+      <span class="track" aria-hidden="true"></span>
+    </label>
+    <div class="row-main">
+      <div class="row-title">Notify me about urgent mail</div>
+      <div class="row-sub" id="notify-sub">
+        A browser notification when an interview invite, assessment, or offer arrives.
+      </div>
+    </div>
+    <div class="row-actions">
+      <button class="btn sm" id="notify-test" onclick="testNotification()" hidden>Test</button>
+    </div>
+  </div>
+
+  <div class="card-body">
+    <div class="field-row">
+      <div class="field">
+        <label for="s-lookback">Look back (days)</label>
+        <input type="number" id="s-lookback" value="{{ cfg.check.lookback_days }}" min="1" max="365">
+        <div class="hint">How far back each check <em>fetches</em>. This is the main
+          thing that decides how long a check takes — every run re-downloads each
+          unread message inside the window. Keep it small; mail already fetched
+          stays in the database and still shows in the views above.</div>
+      </div>
+      <div class="field">
+        <label for="s-batch">Emails per request</label>
+        <input type="number" id="s-batch" value="{{ cfg.llm.batch_size }}" min="1" max="32">
+        <div class="hint">Lower this if the model returns garbled results or you hit rate limits.</div>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="s-chars">Body characters sent</label>
+        <input type="number" id="s-chars" value="{{ cfg.llm.max_body_chars }}" min="200" max="8000">
+        <div class="hint">Less text sent means lower cost and less exposure.</div>
+      </div>
+      <div class="field">
+        <label for="s-interval">Check every (minutes)</label>
+        <input type="number" id="s-interval" value="{{ cfg.watch.interval_minutes }}" min="1" max="1440">
+        <div class="hint">Used by automatic checks above and by
+          <code>mail-check watch</code>.</div>
+      </div>
+    </div>
+  </div>
+  <div class="row" style="justify-content:flex-end">
+    <button class="btn primary" data-busy="Saving…" onclick="saveSettings(this)">Save</button>
+  </div>
+</div>
+
+<div class="card" id="outlook">
+  <div class="card-head">
+    <h2>Outlook</h2>
+    <p>Needed only for personal Outlook.com, Hotmail and Live accounts.</p>
+  </div>
+  <div class="card-body">
+    <div class="field">
+      <label for="s-client">Microsoft application (client) ID</label>
+      <input type="text" id="s-client" value="{{ cfg.outlook.client_id }}"
+             placeholder="00000000-0000-0000-0000-000000000000">
+      <div class="hint">
+        Register a <strong>public client</strong> application in the Microsoft Entra admin
+        center with delegated <code>Mail.Read</code> permission and device-code flow enabled,
+        then paste its Application ID here. It is a public identifier, not a secret — no
+        client secret is ever used or stored.
+      </div>
+    </div>
+    <div class="note">
+      Sign-in uses the device authorization grant against the <code>/consumers</code>
+      authority. Tokens live in the OS keyring, never in a file, and mail-check only ever
+      issues read requests to Microsoft Graph.
+    </div>
+  </div>
+  <div class="row" style="justify-content:flex-end">
+    <button class="btn primary" data-busy="Saving…" onclick="saveSettings(this)">Save</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>Local rules</h2>
+    <p>Label mail by sender before it reaches the model — faster, free, and it never leaves
+       your machine. Known job-board digests are already filtered.</p>
+  </div>
+  {% if cfg.prefilter_rules %}
+    {% for r in cfg.prefilter_rules %}
+    <div class="row">
+      <div class="row-main">
+        <div class="row-title">{{ r.category }}</div>
+        <div class="row-sub">
+          {%- if r.sender %}from {{ r.sender }}{% endif -%}
+          {%- if r.sender_domain %}domain {{ r.sender_domain }}{% endif -%}
+          {%- if r.subject_contains %} · subject contains “{{ r.subject_contains }}”{% endif -%}
+        </div>
+      </div>
+      <div class="row-actions">
+        <button class="btn sm danger" onclick="deleteRule({{ loop.index0 }})">Remove</button>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+  <div class="card-body">
+    <div class="field-row">
+      <div class="field">
+        <label for="r-cat">Label as</label>
+        <select id="r-cat">
+          {% for c in categories %}
+          <option value="{{ c.name }}" {% if c.name == 'job_alert' %}selected{% endif %}>{{ c.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="r-sender">Sender address</label>
+        <input type="text" id="r-sender" placeholder="alerts@example.com">
+      </div>
+      <div class="field">
+        <label for="r-domain">or domain</label>
+        <input type="text" id="r-domain" placeholder="example.com">
+      </div>
+    </div>
+    <button class="btn" data-busy="Adding…" onclick="addRule(this)">Add rule</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>Privacy</h2></div>
+  <div class="card-body">
+    <div class="note">
+      Sender, subject and the first <strong>{{ cfg.llm.max_body_chars }}</strong> characters of
+      each email body are sent to your configured endpoint. Job-application mail contains real
+      names, phone numbers and salary discussion, and free tiers on model routers commonly
+      log — and sometimes train on — request data.<br><br>
+      To exclude a sensitive mailbox, pause it on the <a href="/accounts">Accounts</a> page
+      rather than deleting it.
+    </div>
+    <div class="hint" style="margin-top:12px">
+      Config: <code>{{ config_path }}</code><br>
+      Database: <code>{{ db_path }}</code>
+    </div>
+  </div>
+  <div class="row">
+    <label class="switch">
+      <input type="checkbox" id="s-privacy" {% if cfg.privacy_ack %}checked{% endif %}
+             aria-label="I understand email content is sent to my configured model endpoint"
+             onchange="togglePrivacyAck(this)">
+      <span class="track" aria-hidden="true"></span>
+    </label>
+    <div class="row-main">
+      <div class="row-title">I understand and accept this</div>
+      <div class="row-sub">
+        An explicit record of consent — saving other settings never sets this on your behalf.
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* Notification state lives in the browser, not the config: permission is granted
+   per browser, so a server-side flag would lie in every other one. */
+function refreshNotifyRow() {
+  const box = document.getElementById("s-notify");
+  const sub = document.getElementById("notify-sub");
+  const test = document.getElementById("notify-test");
+  if (!notifySupported()) {
+    box.checked = false;
+    box.disabled = true;
+    sub.textContent = "This browser does not support notifications.";
+    return;
+  }
+  const on = notifyEnabled();
+  box.checked = on;
+  test.hidden = !on;
+  if (Notification.permission === "denied") {
+    sub.textContent =
+      "Blocked for this site. Allow notifications in your browser's site settings to re-enable.";
+  } else if (on) {
+    sub.textContent =
+      "On for this browser. Interview invites, assessments and offers are announced once each.";
+  } else {
+    sub.textContent =
+      "A browser notification when an interview invite, assessment, or offer arrives.";
+  }
+}
+
+async function toggleBrowserNotify(el) {
+  if (el.checked) {
+    const ok = await enableNotifications();
+    if (!ok) el.checked = false;
+    else toast("Notifications on for this browser.");
+  } else {
+    disableNotifications();
+    toast("Notifications off.");
+  }
+  refreshNotifyRow();
+}
+
+/* Reports what actually happened: a silent no-op here is the whole problem with
+   the Notification API — a granted permission does not guarantee a visible popup
+   if the OS is suppressing them. */
+function testNotification() {
+  if (!notifySupported()) {
+    toast("This browser does not support notifications.", false);
+    return;
+  }
+  if (Notification.permission !== "granted") {
+    toast(`Permission is "${Notification.permission}", not "granted".`, false);
+    return;
+  }
+  try {
+    const n = new Notification("Interview invite — Acme", {
+      body: "Sample notification · Offers a 30-minute phone screen.",
+      tag: "mailcheck-test-" + Date.now(),   // a reused tag replaces silently
+    });
+    n.onerror = () =>
+      toast("The browser rejected the notification. Check Windows Settings → "
+          + "System → Notifications for your browser.", false);
+    n.onshow = () => toast("Notification shown.");
+    setTimeout(() => {
+      toast("Sent. If nothing appeared, Windows is suppressing it — check "
+          + "Settings → System → Notifications, make sure your browser is "
+          + "allowed, and turn off Do not disturb.", true, 9000);
+    }, 1200);
+  } catch (e) {
+    toast("Could not create the notification: " + e.message, false);
+  }
+}
+
+document.addEventListener("DOMContentLoaded", refreshNotifyRow);
+
+async function togglePrivacyAck(el) {
+  try {
+    toast((await api("/api/settings", { privacy_ack: el.checked })).message);
+  } catch (e) {
+    el.checked = !el.checked;
+    toast(e.message, false);
+  }
+}
+
+function settingsBody() {
+  const num = (id) => {
+    const v = parseInt(document.getElementById(id).value, 10);
+    return Number.isFinite(v) ? v : undefined;
+  };
+  const body = {
+    base_url: document.getElementById("s-base").value.trim(),
+    model: document.getElementById("s-model").value.trim(),
+    batch_size: num("s-batch"),
+    max_body_chars: num("s-chars"),
+    lookback_days: num("s-lookback"),
+    interval_minutes: num("s-interval"),
+  };
+  const client = document.getElementById("s-client");
+  if (client) body.outlook_client_id = client.value.trim();
+  const token = document.getElementById("s-token").value;
+  if (token) body.token = token;          // blank means "keep the stored one"
+  return body;
+}
+
+async function saveSettings(btn) {
+  await withBusy(btn, async () => {
+    try {
+      toast((await api("/api/settings", settingsBody())).message);
+      document.getElementById("s-token").value = "";
+      setTimeout(() => location.reload(), 800);
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+async function testModel(btn) {
+  await withBusy(btn, async () => {
+    try {
+      // Save first, so the test uses exactly what is on screen.
+      await api("/api/settings", settingsBody());
+      document.getElementById("s-token").value = "";
+      toast((await api("/api/settings/test")).message);
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+async function addRule(btn) {
+  const body = {
+    category: document.getElementById("r-cat").value,
+    sender: document.getElementById("r-sender").value.trim() || null,
+    sender_domain: document.getElementById("r-domain").value.trim() || null,
+  };
+  if (!body.sender && !body.sender_domain) {
+    toast("Enter a sender address or a domain.", false);
+    return;
+  }
+  await withBusy(btn, async () => {
+    try {
+      toast((await api("/api/rules", body)).message);
+      setTimeout(() => location.reload(), 700);
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+async function deleteRule(index) {
+  try {
+    toast((await api(`/api/rules/${index}/delete`)).message);
+    setTimeout(() => location.reload(), 700);
+  } catch (e) { toast(e.message, false); }
+}
+</script>
+{% endblock %}

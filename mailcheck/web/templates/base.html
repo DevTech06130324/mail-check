@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}mail-check{% endblock %}</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📬</text></svg>">
+</head>
+<body>
+
+<a href="#main" class="sr-only">Skip to content</a>
+<div id="bar" hidden role="presentation"></div>
+
+<nav class="nav" aria-label="Sections">
+  <span class="brand">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="2" y="4" width="20" height="16" rx="3"/><path d="m3 7 9 6 9-6"/>
+    </svg>
+    <span>mail-check</span>
+  </span>
+
+  <div class="segmented">
+    <a href="/" class="{{ 'on' if page == 'triage' }}"
+       {% if page == 'triage' %}aria-current="page"{% endif %}>
+      Triage{% if urgent_count %}<span class="dot" aria-hidden="true"></span>
+      <span class="sr-only">, {{ urgent_count }} need action</span>{% endif %}
+    </a>
+    <a href="/accounts" class="{{ 'on' if page == 'accounts' }}"
+       {% if page == 'accounts' %}aria-current="page"{% endif %}>Accounts</a>
+    <a href="/settings" class="{{ 'on' if page == 'settings' }}"
+       {% if page == 'settings' %}aria-current="page"{% endif %}>Settings</a>
+  </div>
+
+  <button class="next-check" id="next-check" hidden
+          title="Automatic checks — click to turn off"></button>
+
+  <button class="btn primary sm" data-check data-busy="Checking…"
+          {% if not llm_ready or not has_accounts %}disabled
+          title="Finish setup first"{% endif %}>Check now</button>
+
+<script>
+  window.MAILCHECK = {
+    auto: {{ 'true' if auto_check else 'false' }},
+    nextIn: {{ next_in if next_in is not none else 'null' }}
+  };
+</script>
+</nav>
+
+<main id="main">
+  {% block content %}{% endblock %}
+</main>
+
+<!-- Routine progress is polite; failures are announced assertively. -->
+<div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
+<div id="alerts" role="alert" aria-live="assertive" class="sr-only"></div>
+<script src="/static/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

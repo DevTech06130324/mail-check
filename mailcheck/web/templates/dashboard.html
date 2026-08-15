@@ -1,0 +1,338 @@
+{% extends "base.html" %}
+{% block title %}{% if view == 'completed' %}Completed{% elif view == 'all' %}All mail{% else %}Queue{% endif %} · mail-check{% endblock %}
+{% block content %}
+
+{% set q = "&account=" ~ selected_account if selected_account else "" %}
+{% set q = q ~ ("&days=" ~ days if days != 30 else "") %}
+
+<div class="page-head">
+  <h1>
+    {% if view == 'queue' %}
+      {% if summary.actionable %}{{ summary.actionable }} to handle{% else %}All clear{% endif %}
+    {% elif view == 'completed' %}Completed
+    {% else %}All mail{% endif %}
+  </h1>
+  <p id="status-line">
+    {{ last_run }}{% if not auto_check %} · <a href="/settings">Turn on automatic checks</a>{% endif %}
+  </p>
+</div>
+
+{% if not llm_ready %}
+<div class="banner warn">
+  <div>
+    <div class="b-title">Connect a model to start</div>
+    <div class="b-body">mail-check needs an OpenAI-compatible endpoint before it can classify anything.</div>
+  </div>
+  <a class="btn primary sm" href="/settings">Open Settings</a>
+</div>
+{% elif not has_accounts %}
+<div class="banner">
+  <div>
+    <div class="b-title">Add a mailbox</div>
+    <div class="b-body">Your model is connected. Add an email account and mail-check can start reading it.</div>
+  </div>
+  <a class="btn primary sm" href="/accounts">Add account</a>
+</div>
+{% endif %}
+
+<nav class="views" aria-label="Mail views">
+  <a href="/?view=queue{{ q }}" {% if view == 'queue' %}aria-current="page"{% endif %}>
+    Queue{% if summary.actionable %} <span class="count">{{ summary.actionable }}</span>{% endif %}
+  </a>
+  <a href="/?view=all{{ q }}" {% if view == 'all' %}aria-current="page"{% endif %}>
+    All mail{% if summary.informational or summary.actionable %} <span class="count">{{ summary.informational + summary.actionable }}</span>{% endif %}
+  </a>
+  <a href="/?view=completed{{ q }}" {% if view == 'completed' %}aria-current="page"{% endif %}>
+    Completed{% if summary.done %} <span class="count">{{ summary.done }}</span>{% endif %}
+  </a>
+</nav>
+
+<details class="filters">
+  <summary>Filters{% if selected_account or selected_category or days != 30 %} · active{% endif %}</summary>
+  <form method="get" class="filter-row">
+    <input type="hidden" name="view" value="{{ view }}">
+    <select name="account" onchange="this.form.submit()" aria-label="Account">
+      <option value="">All accounts</option>
+      {% for a in accounts %}
+      <option value="{{ a.label }}" {% if a.label == selected_account %}selected{% endif %}>{{ a.label }}</option>
+      {% endfor %}
+    </select>
+    <select name="category" onchange="this.form.submit()" aria-label="Category">
+      <option value="">All categories</option>
+      {% for c in categories %}
+      <option value="{{ c.name }}" {% if c.name == selected_category %}selected{% endif %}>
+        {{ c.label }} ({{ counts.get(c.name, 0) }})
+      </option>
+      {% endfor %}
+    </select>
+    <select name="days" onchange="this.form.submit()" aria-label="Time range">
+      {% for d in [2, 3, 7, 14, 30, 90] %}
+      <option value="{{ d }}" {% if d == days %}selected{% endif %}>Last {{ d }} days</option>
+      {% endfor %}
+    </select>
+    {% if selected_account or selected_category or days != 30 %}
+    <a class="btn sm" href="/?view={{ view }}">Clear</a>
+    {% endif %}
+  </form>
+</details>
+
+<div id="queue">
+{% set shown = namespace(any=false) %}
+{% for tier in tier_order %}
+  {% set items = groups.get(tier, []) %}
+  {% if items %}
+    {% set shown.any = true %}
+    <section class="tier {{ tier }}">
+      <!-- Always render: suppressing it for the first group made that group's
+           layout differ from every other, and made the heading appear to vanish
+           as items above it were cleared. -->
+      <h2 class="tier-head">
+        <span class="bead" aria-hidden="true"></span>{{ tier_meta[tier][0] }}
+        <span class="n">{{ items|length }}</span>
+        <!-- Not on Completed: the count there is of finished items, but a bulk
+             retry is scoped by category alone and would sweep up the live queue
+             too — a button whose number does not describe what it does. The
+             per-card retry below stays available in every view. -->
+        {% if tier == 'unknown' and unclassified_count and llm_ready and view != 'completed' %}
+        <!-- A failed classification is cached under the same key as a good one,
+             so an ordinary check will never revisit it. This is the way back. -->
+        <button class="btn sm retry-all" data-busy="Retrying…"
+                onclick="reclassifyAll(this)"
+                title="Ask the model again about the mail it could not classify">
+          Classify again ({{ unclassified_count }})
+        </button>
+        {% endif %}
+      </h2>
+
+      {% for i in items %}
+      <article class="mail{% if i.handled_at %} is-done{% endif %}" id="mail-{{ i.pk }}"
+               data-pk="{{ i.pk }}">
+        <div class="mail-top">
+          <span class="chip">{{ i.category_label }}</span>
+          {% if i.deadline_display %}
+          <span class="due{% if 'Overdue' in i.deadline_display or i.deadline_display == 'Due today' %} urgent{% endif %}">
+            {{ i.deadline_display }}
+          </span>
+          {% endif %}
+          <span class="when">{{ i.date_display }}</span>
+        </div>
+
+        <h3 class="who">
+          {%- if i.company and i.role %}{{ i.company }} — {{ i.role }}
+          {%- elif i.company %}{{ i.company }}
+          {%- elif i.role %}{{ i.role }}
+          {%- else %}{{ i.from_name or i.from_addr }}{% endif -%}
+        </h3>
+
+        <p class="summary">{{ i.summary or i.snippet }}</p>
+
+        <div class="actions">
+          {% if i.open_url %}
+          <a class="btn sm primary" href="{{ i.open_url }}" target="_blank" rel="noopener">
+            {{ i.open_label }}
+          </a>
+          {% endif %}
+          {% if i.category == 'unclassified' and llm_ready %}
+          <button class="btn sm" data-busy="Retrying…" onclick="reclassifyOne({{ i.pk }}, this)"
+                  title="Ask the model again about just this email">Classify again</button>
+          {% endif %}
+          {% if i.handled_at %}
+          <button class="btn sm" onclick="setDone({{ i.pk }}, false, this)">Restore</button>
+          {% else %}
+          <button class="btn sm" onclick="setDone({{ i.pk }}, true, this)">Done</button>
+          {% endif %}
+          <details class="detail">
+            <summary>Details</summary>
+            <div class="detail-body">
+              <div class="kv"><span>Subject</span><span>{{ i.subject }}</span></div>
+              <div class="kv"><span>From</span><span>{{ i.from_addr }}</span></div>
+              <div class="kv"><span>Account</span><span>{{ i.account_label }}</span></div>
+              {% if i.confidence and i.confidence < 0.5 %}
+              <div class="kv"><span>Confidence</span><span>Low ({{ (i.confidence * 100)|round|int }}%)</span></div>
+              {% endif %}
+              {% if i.source == 'prefilter' %}
+              <div class="kv"><span>Source</span><span>Local rule</span></div>
+              {% endif %}
+              <!-- Loaded on first open, not with the page: 500 full email
+                   bodies inline was most of this document's weight, for
+                   something read one at a time if at all. -->
+              <pre data-body="{{ i.pk }}">Loading…</pre>
+            </div>
+          </details>
+        </div>
+      </article>
+      {% endfor %}
+    </section>
+  {% endif %}
+{% endfor %}
+</div>
+
+<div class="empty" id="empty-state" {% if shown.any %}hidden{% endif %}>
+  {% if view == 'queue' and llm_ready and has_accounts and (summary.informational or summary.done) %}
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20 6 9 17l-5-5"/>
+    </svg>
+    <h3>Queue clear</h3>
+    <p>Nothing needs a reply right now. {{ summary.informational }} informational
+       {{ 'email' if summary.informational == 1 else 'emails' }} are waiting in All mail.</p>
+    <a class="btn" href="/?view=all{{ q }}">View all mail</a>
+  {% elif view == 'completed' %}
+    <h3>Nothing completed yet</h3>
+    <p>Messages you mark Done appear here, and can be restored to the queue at any time.</p>
+    <a class="btn" href="/?view=queue{{ q }}">Back to queue</a>
+  {% elif llm_ready and has_accounts %}
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="2" y="4" width="20" height="16" rx="3"/><path d="m3 7 9 6 9-6"/>
+    </svg>
+    <h3>No mail triaged yet</h3>
+    <p>Run a check and mail-check will read your unread mail, sort it, and show what needs action.</p>
+    <button class="btn primary" data-check data-busy="Checking…">Check now</button>
+  {% else %}
+    <h3>Almost ready</h3>
+    <p>Finish setup and your inbox triage will appear here.</p>
+    <a class="btn primary" href="{{ '/settings' if not llm_ready else '/accounts' }}">
+      {{ 'Connect a model' if not llm_ready else 'Add an account' }}
+    </a>
+  {% endif %}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* The card is removed and the badges are repainted from the counts the server
+   sends back, rather than reloading. A reload re-ran every dashboard query and
+   rebuilt the whole card list to change three numbers — and it threw away the
+   reader's scroll position on every single Done click. */
+async function setDone(pk, done, btn) {
+  try {
+    const r = await api(`/api/messages/${pk}/handled?done=${done}`);
+    const card = document.getElementById(`mail-${pk}`);
+    if (card) {
+      card.classList.add("leaving");
+      setTimeout(() => dropCard(card), 300);
+    }
+    applySummary(r.summary);
+    toastUndo(r.message, pk, !done);
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
+/** Remove a card, keep its group's own count honest, and drop the group
+    entirely once it is empty so no orphaned heading is left behind. */
+function dropCard(card) {
+  const section = card.closest("section.tier");
+  card.remove();
+  if (section) {
+    const left = section.querySelectorAll("article.mail").length;
+    const n = section.querySelector(".tier-head .n");
+    if (n) n.textContent = left;
+    if (!left) section.remove();
+  }
+  if (!document.querySelectorAll("#queue article.mail").length) {
+    const empty = document.getElementById("empty-state");
+    if (empty) empty.hidden = false;
+  }
+}
+
+/** Repaint the nav dot and the three view tabs from a fresh queue summary. */
+function applySummary(s) {
+  if (!s) return;
+  const set = (sel, value) => {
+    const el = document.querySelector(sel);
+    if (!el) return;
+    const badge = el.querySelector(".count");
+    if (value > 0) {
+      if (badge) badge.textContent = value;
+      else el.insertAdjacentHTML("beforeend", ` <span class="count">${value}</span>`);
+    } else if (badge) {
+      badge.remove();
+    }
+  };
+  set('.views a[href*="view=queue"]', s.actionable);
+  set('.views a[href*="view=all"]', s.actionable + s.informational);
+  set('.views a[href*="view=completed"]', s.done);
+
+  const dot = document.querySelector(".segmented .dot");
+  if (dot && !s.actionable) dot.remove();
+
+  const h1 = document.querySelector(".page-head h1");
+  if (h1 && "{{ view }}" === "queue") {
+    h1.textContent = s.actionable ? `${s.actionable} to handle` : "All clear";
+  }
+}
+
+/* ------------------------------------------------------------- reclassify */
+
+/* Retry runs through the same background job as a check, so the progress bar
+   and status line already know how to display it — all this has to do is start
+   it and hand over to pollStatus(). */
+async function reclassifyAll(btn) {
+  await withBusy(btn, async () => {
+    try {
+      const r = await api("/api/reclassify", { days: {{ days }},
+                                               account: {{ (selected_account or None)|tojson }} });
+      toast(`Re-classifying ${r.count} email${r.count === 1 ? "" : "s"}…`);
+      document.getElementById("bar").hidden = false;
+      pollStatus();
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+async function reclassifyOne(pk, btn) {
+  await withBusy(btn, async () => {
+    try {
+      await api("/api/reclassify", { pks: [pk] });
+      toast("Asking the model again…");
+      document.getElementById("bar").hidden = false;
+      pollStatus();
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
+/* ------------------------------------------------------------ lazy bodies */
+
+/* `toggle` does not bubble, so this listens in the capture phase. */
+document.addEventListener("toggle", (e) => {
+  const details = e.target;
+  if (!details.open || !details.classList || !details.classList.contains("detail")) return;
+  const pre = details.querySelector("pre[data-body]");
+  if (!pre || pre.dataset.loaded) return;
+  pre.dataset.loaded = "1";
+  fetch(`/api/messages/${pre.dataset.body}/body`)
+    .then((r) => r.json())
+    .then((d) => { pre.textContent = d.body || "(no body stored for this message)"; })
+    .catch(() => {
+      pre.dataset.loaded = "";       // let the next open try again
+      pre.textContent = "Could not load the message body.";
+    });
+}, true);
+
+/* Success toast carries Undo, per the design; Completed keeps a persistent
+   Restore for after the toast is gone. */
+function toastUndo(message, pk, revertTo) {
+  const host = document.getElementById("toasts");
+  const el = document.createElement("div");
+  el.className = "toast ok";
+  el.innerHTML = `<span class="mark" aria-hidden="true">✓</span><span class="msg"></span>`;
+  el.querySelector(".msg").textContent = message;
+  const undo = document.createElement("button");
+  undo.className = "toast-action";
+  undo.textContent = "Undo";
+  undo.onclick = async () => {
+    el.remove();
+    await api(`/api/messages/${pk}/handled?done=${revertTo}`);
+    location.reload();
+  };
+  el.appendChild(undo);
+  host.appendChild(el);
+  setTimeout(() => {
+    el.classList.add("out");
+    setTimeout(() => el.remove(), 260);
+  }, 6000);
+}
+</script>
+{% endblock %}

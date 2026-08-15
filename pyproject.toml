@@ -1,0 +1,34 @@
+[project]
+name = "mail-check"
+version = "0.1.0"
+description = "Triage unread job-application email: fetch, classify with an LLM, report what needs action."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "imap-tools>=1.7",
+    "keyring>=25.0",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "platformdirs>=4.2",
+    "html2text>=2024.2.26",
+    "tomli-w>=1.0",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+    "msal>=1.28",
+]
+
+[project.scripts]
+mail-check = "mailcheck.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mailcheck*"]
+
+[tool.setuptools.package-data]
+"mailcheck.web" = ["templates/*.html", "static/*"]
