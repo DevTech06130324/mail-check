@@ -114,6 +114,11 @@
             {{ i.deadline_display }}
           </span>
           {% endif %}
+          <!-- Which mailbox it arrived in, on the card face rather than only
+               behind Details: with more than one account connected, "is this
+               my personal or my work address?" changes how you answer, and
+               that is not a question worth a click per card. -->
+          <span class="acct"><span class="sr-only">Account: </span>{{ i.account_label }}</span>
           <span class="when">{{ i.date_display }}</span>
         </div>
 

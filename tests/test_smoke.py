@@ -691,6 +691,27 @@ def test_action_queue(msgs):
         check("active view marked with aria-current",
               'aria-current="page"' in client.get("/").text)
 
+        # Which mailbox a message arrived in has to be readable without opening
+        # anything, so every assertion here runs against the card with its
+        # <details> block stripped out — the account living only inside Details
+        # is exactly the bug this guards against.
+        import re
+
+        strip_details = lambda html: re.sub(
+            r'<details class="detail">.*?</details>', "", html, flags=re.S)
+
+        faces = strip_details(cards(client.get("/")))
+        labels = faces.count('class="acct"')
+        articles = faces.count('<article class="mail')
+        check("the account is on the card face, not only behind Details",
+              labels > 0 and "gmail" in faces)
+        check("  every card carries one", labels == articles,
+              "%d labels for %d cards" % (labels, articles))
+        check("  and it is labelled for screen readers",
+              '<span class="sr-only">Account: </span>gmail' in faces)
+        check("  All mail too",
+              'class="acct"' in strip_details(cards(client.get("/?view=all"))))
+
         check("mark Done over the API",
               client.post(f"/api/messages/{pks[0]}/handled?done=true").json()["done"] is True)
         check("  queue drops it", "Interview invite" not in cards(client.get("/")))
