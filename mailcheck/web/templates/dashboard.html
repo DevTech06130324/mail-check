@@ -114,11 +114,6 @@
             {{ i.deadline_display }}
           </span>
           {% endif %}
-          <!-- Which mailbox it arrived in, on the card face rather than only
-               behind Details: with more than one account connected, "is this
-               my personal or my work address?" changes how you answer, and
-               that is not a question worth a click per card. -->
-          <span class="acct"><span class="sr-only">Account: </span>{{ i.account_label }}</span>
           <span class="when">{{ i.date_display }}</span>
         </div>
 
@@ -128,6 +123,14 @@
           {%- elif i.role %}{{ i.role }}
           {%- else %}{{ i.from_name or i.from_addr }}{% endif -%}
         </h3>
+
+        <!-- Which mailbox it arrived in, sitting between the headline and the
+             summary: it reads as part of "what is this", picked up on the way
+             from who it is about down to what they want. On the card face
+             rather than only behind Details, because with more than one
+             account connected "is this my personal or my work address?"
+             changes how you answer, and that is not worth a click per card. -->
+        <span class="acct"><span class="sr-only">Account: </span>{{ i.account_label }}</span>
 
         <p class="summary">{{ i.summary or i.snippet }}</p>
 

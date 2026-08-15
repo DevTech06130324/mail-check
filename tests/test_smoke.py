@@ -709,6 +709,14 @@ def test_action_queue(msgs):
               "%d labels for %d cards" % (labels, articles))
         check("  and it is labelled for screen readers",
               '<span class="sr-only">Account: </span>gmail' in faces)
+        # Between the headline and the summary — read on the way from who it is
+        # about down to what they want, not lost among the pills above.
+        placed = len(re.findall(
+            r'</h3>\s*(?:<!--.*?-->\s*)?'
+            r'<span class="acct"><span class="sr-only">Account: </span>'
+            r'[^<]*</span>\s*<p class="summary">', faces, flags=re.S))
+        check("  between the headline and the summary", placed == articles,
+              "%d placed for %d cards" % (placed, articles))
         check("  All mail too",
               'class="acct"' in strip_details(cards(client.get("/?view=all"))))
 
