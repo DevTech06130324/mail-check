@@ -145,6 +145,19 @@ runs(id, started_at, finished_at, accounts_checked,
 **Cache key is `(message_id, model, prompt_version)`.** Re-running costs nothing; changing the
 model or bumping the prompt version transparently forces re-classification.
 
+**Retention: the store is a rolling window, not an archive.** Every check deletes messages
+older than `check.retain_days` (default 7) before it fetches, Completed included;
+classifications follow by `ON DELETE CASCADE`. Undated mail ages out on `fetched_at`, so a
+missing `Date` header cannot buy an indefinite stay. Purely local — provider mail is never
+touched, and a pruned message is still unread in the mailbox.
+
+The window pruned is `max(retain_days, lookback_days)`, never `retain_days` alone. Deleting
+a message the same run is about to re-download would recreate it as a new row with no
+`handled_at`, silently undoing a Done. Keeping the retention and fetch windows from
+overlapping makes that impossible rather than merely unlikely. The remaining hole is
+deliberate and documented: a `--since` reaching past the retention window re-fetches mail
+already pruned, which arrives as new.
+
 IMAP passwords, the LLM token, and serialized Outlook MSAL token caches live in the OS
 keyring under distinct `mail-check` entries. The SQLite and TOML files contain no secrets;
 the Microsoft application client ID is a public identifier, not a credential.

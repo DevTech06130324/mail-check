@@ -84,7 +84,7 @@ mail-check watch -i 30
 mail-check web                    # management console on 127.0.0.1:8765
 
 mail-check account list | test <label> | remove <label> | enable <label> --off
-mail-check config show | set llm.batch_size 4 | token | test
+mail-check config show | set llm.batch_size 4 | set check.retain_days 30 | token | test
 ```
 
 ## The console
@@ -101,8 +101,8 @@ Three pages, all of it local:
 - **Accounts** — connect an IMAP mailbox with an app password, or sign in to a personal
   Outlook account with Microsoft. Test, pause, or remove any of them.
 - **Settings** — endpoint, model and token; automatic checks; batch size, body length,
-  lookback and interval; and local sender rules that label mail before it ever reaches
-  the model.
+  lookback, retention and interval; and local sender rules that label mail before it
+  ever reaches the model.
 
 Turn on **Check automatically** in Settings and the console runs the check itself on your
 interval. A live countdown — *Next check in 7:24* — sits in the toolbar on every page;
@@ -189,7 +189,29 @@ visible notification, since Windows can suppress your browser's notifications in
 **Done** marks an item finished in mail-check's own database. It does not mark the message
 read, move it, label it, or change anything in Gmail or Outlook — provider mail is only ever
 read. Re-running a check never resurrects something you finished, and Completed can restore
-it whenever you want.
+it for as long as the message is kept.
+
+## Mail ages out after a week
+
+The local database is a rolling window, not an archive. **Every check deletes triaged mail
+older than seven days**, Completed included, so a queue you have been running for months
+does not turn into a pile of stored email bodies. A triage list older than a week has
+either been dealt with or is not going to be.
+
+```bash
+mail-check config set check.retain_days 30    # keep a month instead
+```
+
+This only ever deletes from mail-check's own database. The message itself is untouched in
+Gmail or Outlook, still unread, exactly as it was — deleting the local copy is not a
+mailbox operation and never becomes one.
+
+A check never prunes inside its own fetch window, even when `lookback_days` is set wider
+than `retain_days`; the effective window is whichever is longer. That is what keeps Done
+from quietly undoing itself: a message deleted and re-downloaded on the same run would
+come back as a new row with nothing marked on it. The one way to resurface finished mail
+is to deliberately reach back past the retention window — `mail-check check --since 30d`
+will re-fetch anything still unread that has already been pruned, and it arrives as new.
 
 ## Outlook
 

@@ -78,6 +78,23 @@ def check_once(
     lookback = since_days if since_days is not None else cfg.check.lookback_days
     since = (datetime.now(timezone.utc) - timedelta(days=lookback)).date()
 
+    # ---- retention -------------------------------------------------------
+    # The local store is a rolling window, not an archive. Runs before the
+    # fetch and on every path out of here, including the ones that fetch
+    # nothing: how much mail is kept must not depend on whether this
+    # particular check happened to find any.
+    #
+    # Never prunes inside the fetch window, even when the fetch window is the
+    # wider of the two. A message deleted and then immediately re-downloaded
+    # comes back as a new row with no handled_at — silently undoing a Done the
+    # user had already given it. Keeping the two windows from overlapping is
+    # what makes that impossible rather than merely unlikely.
+    keep_days = max(cfg.check.retain_days, lookback)
+    result.pruned = db.prune_messages(
+        conn,
+        before_iso=(datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat(),
+    )
+
     # ---- fetch (one bad mailbox must not abort the run) -------------------
     fetched: list[NormalizedMessage] = []
     for account in accounts:

@@ -106,6 +106,16 @@
           <code>mail-check watch</code>.</div>
       </div>
     </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="s-retain">Keep mail for (days)</label>
+        <input type="number" id="s-retain" value="{{ cfg.check.retain_days }}" min="1" max="3650">
+        <div class="hint">Every check deletes triaged mail older than this, Completed
+          included — the local store is a rolling window, not an archive. Deletes only
+          from mail-check's own database: the message is still in Gmail or Outlook,
+          still unread. Never reaches inside the fetch window above.</div>
+      </div>
+    </div>
   </div>
   <div class="row" style="justify-content:flex-end">
     <button class="btn primary" data-busy="Saving…" onclick="saveSettings(this)">Save</button>
@@ -314,6 +324,7 @@ function settingsBody() {
     batch_size: num("s-batch"),
     max_body_chars: num("s-chars"),
     lookback_days: num("s-lookback"),
+    retain_days: num("s-retain"),
     interval_minutes: num("s-interval"),
   };
   const client = document.getElementById("s-client");

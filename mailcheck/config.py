@@ -55,8 +55,26 @@ class CheckConfig(BaseModel):
     message inside this window before the cache can discard it, so a 30-day
     window costs ~15x a 2-day one on a mailbox that is checked regularly.
     Nothing is lost by shrinking it: mail fetched under an older, wider window
-    stays in the database and keeps showing up in the console's own (separate)
-    display range.
+    stays in the database until it ages out of ``retain_days``, and keeps
+    showing up in the console's own (separate) display range until then.
+    """
+
+    retain_days: int = Field(default=7, ge=1, le=3650)
+    """How long triaged mail is kept locally. Older mail is deleted on each check.
+
+    The local store is a rolling window, not an archive: without this it grows
+    forever, and a stored message is a full email body sitting on disk. Seven
+    days is what a triage queue actually needs — anything older has been dealt
+    with or is not going to be.
+
+    Only ever deletes from mail-check's own database. Provider mail is never
+    touched, so a pruned message is still in Gmail or Outlook, unread and
+    exactly as it was.
+
+    A check never prunes inside its own fetch window, even when that window is
+    the wider one: a message about to be re-downloaded must not be deleted and
+    re-created, because that would drop its Done state and put it back in the
+    queue. So the effective window is ``max(retain_days, lookback_days)``.
     """
 
 

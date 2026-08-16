@@ -110,6 +110,8 @@ def _render_footer(result: RunResult) -> None:
     ]
     if result.prefiltered:
         bits.append(f"[bold]{result.prefiltered}[/bold] prefiltered")
+    if result.pruned:
+        bits.append(f"[bold]{result.pruned}[/bold] aged out")
     console.print(f"[dim]{' | '.join(bits)}  across {result.accounts_checked} account(s){took}[/dim]")
 
     if result.errors:

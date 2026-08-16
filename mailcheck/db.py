@@ -352,6 +352,28 @@ def get_message_body(conn: sqlite3.Connection, pk: int) -> str | None:
     return None if row is None else (row["body_text"] or "")
 
 
+def prune_messages(conn: sqlite3.Connection, *, before_iso: str) -> int:
+    """Delete stored mail older than ``before_iso``. Returns how many went.
+
+    Local only, like every other write here: this empties rows out of
+    mail-check's own database and never touches a provider mailbox, so a pruned
+    message is still sitting in Gmail or Outlook, still unread.
+
+    Classifications go with it — the foreign key declares ON DELETE CASCADE and
+    ``connect()`` turns foreign keys on, which SQLite does not do by itself.
+
+    Mail with no Date header ages out on when it was fetched instead, so a
+    missing header cannot buy a message an indefinite stay. Both columns hold
+    timezone-aware UTC ISO strings, which order correctly as text — the same
+    comparison every query in this module already makes against a cutoff.
+    """
+    cur = conn.execute(
+        "DELETE FROM messages WHERE COALESCE(date_utc, fetched_at) < ?", (before_iso,)
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 # -------------------------------------------------------------------- classifications
 
 

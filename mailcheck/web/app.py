@@ -113,6 +113,7 @@ class SettingsBody(BaseModel):
     max_body_chars: int | None = None
     concurrency: int | None = None
     lookback_days: int | None = None
+    retain_days: int | None = None
     interval_minutes: int | None = None
     privacy_ack: bool | None = None
 
@@ -210,6 +211,8 @@ def _run_check(body: CheckBody) -> None:
             bits.append(f"{result.from_cache} cached")
         if result.prefiltered:
             bits.append(f"{result.prefiltered} filtered locally")
+        if result.pruned:
+            bits.append(f"{result.pruned} aged out")
         _job.update(
             message=" · ".join(bits),
             detail="\n".join(result.errors[:5]),
@@ -760,6 +763,8 @@ def create_app() -> FastAPI:
                 data["llm"][field] = value
         if body.lookback_days is not None:
             data["check"]["lookback_days"] = body.lookback_days
+        if body.retain_days is not None:
+            data["check"]["retain_days"] = body.retain_days
         if body.interval_minutes is not None:
             data["watch"]["interval_minutes"] = body.interval_minutes
         if body.auto_check is not None:

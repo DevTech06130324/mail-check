@@ -25,7 +25,13 @@ from mailcheck import db, normalize, prefilter, report  # noqa: E402
 from mailcheck.config import Config, PrefilterRule  # noqa: E402
 from mailcheck.llm.classify import classify as run_classify  # noqa: E402
 from mailcheck.llm.schema import parse_results  # noqa: E402
-from mailcheck.models import Classification, RawMessage, RunResult, TriagedMessage  # noqa: E402
+from mailcheck.models import (  # noqa: E402
+    Classification,
+    NormalizedMessage,
+    RawMessage,
+    RunResult,
+    TriagedMessage,
+)
 from mailcheck.taxonomy import UNCLASSIFIED, coerce_category  # noqa: E402
 
 PASS, FAIL = 0, 0
@@ -462,6 +468,13 @@ def test_web_console(msgs):
               client.post("/api/settings", json={"batch_size": -5}).status_code == 400)
         check("out-of-range lookback refused",
               client.post("/api/settings", json={"lookback_days": 0}).status_code == 400)
+        check("retention is settable from the console",
+              client.post("/api/settings", json={"retain_days": 30}).json()["ok"]
+              and cfgmod.load().check.retain_days == 30)
+        check("  and the console offers the control",
+              'id="s-retain"' in client.get("/settings").text)
+        check("out-of-range retention refused",
+              client.post("/api/settings", json={"retain_days": 0}).status_code == 400)
         check("add rule", client.post(
             "/api/rules", json={"category": "job_alert", "sender_domain": "spam.com"}
         ).json()["ok"] and len(cfgmod.load().prefilter_rules) == 1)
@@ -1496,6 +1509,106 @@ def test_config_cache():
         cfgmod.config_path = orig
 
 
+def test_retention():
+    """Mail ages out of the local store on its own.
+
+    The store is a rolling window, not an archive. The delicate part is that it
+    must never reach inside the fetch window: a message deleted and then
+    re-downloaded on the same run would come back as a fresh row with no
+    handled_at, quietly undoing a Done the user had already given it.
+    """
+    import tempfile as tf
+
+    from mailcheck import config as cfgmod
+    from mailcheck import pipeline as pipe
+    from mailcheck import secrets as secmod
+
+    print("\nretention window")
+    tmp = Path(tf.mkdtemp())
+    orig = (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+            pipe.fetch_account)
+    cfgmod.db_path = lambda: tmp / "t.db"
+    cfgmod.config_path = lambda: tmp / "config.toml"
+    secmod.has_llm_token = lambda: True
+    # Retention must not depend on a mailbox being reachable, or on this run
+    # happening to find anything — so every check below fetches nothing at all.
+    pipe.fetch_account = lambda *a, **kw: []
+
+    def _msg(mid, age_days, subject="Subject"):
+        return NormalizedMessage(
+            account_id=1, account_label="gmail", message_id=mid, uid="1",
+            folder="INBOX", from_addr="x@example.com", from_name="X",
+            subject=subject,
+            date_utc=None if age_days is None
+                     else datetime.now(timezone.utc) - timedelta(days=age_days),
+            body="Body.")
+
+    try:
+        conn = db.connect(tmp / "t.db")
+        db.add_account(conn, label="gmail", email="me@x.com", imap_host="imap.gmail.com")
+        fresh = db.upsert_message(conn, _msg("<fresh>", 2))
+        old = db.upsert_message(conn, _msg("<old>", 30))
+        done = db.upsert_message(conn, _msg("<done>", 30))
+        undated = db.upsert_message(conn, _msg("<undated>", None))
+        for pk in (fresh, old, done, undated):
+            db.save_classification(conn, pk, Classification(
+                category="interview_invite", confidence=0.9, summary="s."), "m", "1")
+        db.set_handled(conn, done, True)
+        conn.commit()
+
+        cfg = cfgmod.Config.model_validate(
+            {"llm": {"base_url": "http://x/v1", "model": "m"},
+             "check": {"lookback_days": 2, "retain_days": 7}})
+        cfgmod.save(cfg)
+        result = pipe.check_once(conn, cfg)
+
+        live = {r["message_id"] for r in db.query_triaged(conn)}
+        check("mail past the window is deleted on a check", "<old>" not in live, str(live))
+        check("  inside the window is kept", "<fresh>" in live)
+        check("  Completed ages out too, like everything else", "<done>" not in live)
+        check("  and the run reports how many went", result.pruned == 2, str(result.pruned))
+        check("classifications go with them, never orphaned",
+              conn.execute("SELECT COUNT(*) FROM classifications c LEFT JOIN messages m"
+                           " ON m.id = c.message_pk WHERE m.id IS NULL").fetchone()[0] == 0)
+        # A run that fetches nothing still has to prune, or the window only
+        # closes on days the mailbox happened to have mail in it.
+        check("  pruning does not depend on the fetch finding anything",
+              result.fetched == 0, str(result.fetched))
+
+        # Undated mail ages out on when it was fetched, so a missing Date header
+        # cannot buy an indefinite stay — but it was fetched just now, so it
+        # survives this run and would go once *that* passes the window.
+        check("undated mail falls back to its fetch time", "<undated>" in live)
+
+        # The guard: a fetch window wider than the retention window must widen
+        # what is kept, not delete mail the very next fetch would recreate.
+        keeper = db.upsert_message(conn, _msg("<keeper>", 10))
+        db.save_classification(conn, keeper, Classification(
+            category="offer", confidence=0.9, summary="s."), "m", "1")
+        db.set_handled(conn, keeper, True)
+        conn.commit()
+        wide = cfgmod.Config.model_validate(
+            {"llm": {"base_url": "http://x/v1", "model": "m"},
+             "check": {"lookback_days": 30, "retain_days": 1}})
+        result = pipe.check_once(conn, wide)
+        still = {r["message_id"] for r in db.query_triaged(conn, handled=True)}
+        check("a wider fetch window is never pruned into", "<keeper>" in still, str(still))
+        check("  so Done inside it cannot be resurrected by the next fetch",
+              db.get_message(conn, keeper)["handled_at"] is not None)
+
+        # An explicit --since is a fetch window like any other.
+        result = pipe.check_once(conn, cfg, since_days=30)
+        check("--since widens the window it protects for that run too",
+              "<keeper>" in {r["message_id"] for r in db.query_triaged(conn)})
+
+        conn.close()
+        check("the default keeps a week", cfgmod.Config().check.retain_days == 7,
+              str(cfgmod.Config().check.retain_days))
+    finally:
+        (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+         pipe.fetch_account) = orig
+
+
 def main() -> int:
     print("mail-check smoke test")
     test_password_repair()
@@ -1514,6 +1627,7 @@ def main() -> int:
     test_config_cache()
     test_lazy_bodies_and_inplace_done(msgs)
     test_reclassify(msgs)
+    test_retention()
     print(f"\n{PASS} passed, {FAIL} failed")
     print(
         "\n(Real-OS-keyring integration test is separate and opt-in — it needs an "

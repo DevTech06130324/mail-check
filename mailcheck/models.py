@@ -75,6 +75,8 @@ class RunResult:
     classified: int = 0
     from_cache: int = 0
     prefiltered: int = 0
+    pruned: int = 0
+    """Stored messages deleted for ageing out of the retention window."""
     items: list[TriagedMessage] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
