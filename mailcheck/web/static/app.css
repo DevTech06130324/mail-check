@@ -575,6 +575,10 @@ details.filters[open] > summary::after { content: "▴"; }
   top: var(--pane-top);
   max-height: var(--pane-height);
   overflow-y: auto;
+  /* Explicit, because setting only overflow-y makes the other axis `auto` too
+     — and a row on its way out translates 24px to the right, which is enough
+     to flash a horizontal scrollbar for the length of the animation. */
+  overflow-x: hidden;
   overscroll-behavior: contain;
   padding: 2px 8px 2px 2px;   /* room for the focus ring and the scrollbar */
   margin: -2px 0;
@@ -1054,10 +1058,12 @@ html, body { max-width: 100%; overflow-x: hidden; }
   .mail .who { font-size: 15px; }
   .mail-top { gap: 7px; }
   .mail .when { margin-left: 0; }
-  .actions { gap: 6px; }
-  /* Primary actions stay visible; Details drops below rather than squeezing. */
-  .actions .detail { margin-left: 0; width: 100%; }
-  .actions .btn { flex: 1 1 auto; }
+  /* The reader's actions share the width rather than squeezing, now that
+     there is no Details disclosure competing with them for the row. */
+  .reader-actions { gap: 6px; }
+  .reader-actions .btn { flex: 1 1 auto; }
+  .reader { padding: 16px 14px 20px; }
+  .reader-subject { font-size: 18px; }
   .views a { padding: 6px 11px; font-size: 13px; }
   .kv { flex-direction: column; gap: 0; }
   .kv > span:first-child { flex-basis: auto; }

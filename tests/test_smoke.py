@@ -808,7 +808,7 @@ def test_action_queue(msgs):
         faces = cards(client.get("/"))
         labels = faces.count('class="acct"')
         articles = faces.count('<article class="mail')
-        check("the account is on the card face, not only behind Details",
+        check("the account is readable in the row, not only in the reader",
               labels > 0 and "gmail" in faces)
         check("  every card carries one", labels == articles,
               "%d labels for %d cards" % (labels, articles))
@@ -834,6 +834,34 @@ def test_action_queue(msgs):
         check("  it is back in the queue", "Interview invite" in cards(client.get("/")))
         check("unknown message -> 404",
               client.post("/api/messages/9999/handled?done=true").status_code == 404)
+
+        # The reader arrives as markup and is written with innerHTML, and every
+        # field in it — body, subject, sender, company, role, summary — is
+        # whatever a stranger put in an email. Autoescaping is the only thing
+        # standing between that and script execution, and nothing else in the
+        # suite would notice it being turned off or a |safe creeping in.
+        print("\nhostile mail cannot execute in the console")
+        evil = "<script>alert(1)</script><img src=x onerror=\"alert(2)\">"
+        with db.session() as c2:
+            acc2 = db.get_account(c2, "gmail")
+            hostile = NormalizedMessage(
+                account_id=acc2.id, account_label="gmail", message_id="evil-1", uid="99",
+                folder="INBOX", from_addr="e@v.il", from_name=evil, subject=evil,
+                date_utc=datetime.now(timezone.utc), body="BODY " + evil, provider_url=None)
+            evil_pk = db.upsert_message(c2, hostile)
+            db.save_classification(c2, evil_pk, Classification(
+                category="rejection", confidence=0.9, company=evil, role=evil,
+                deadline=None, action_required=False, summary="SUMMARY " + evil,
+                source="llm"), "m", "1")
+
+        for where, html in (("reader fragment", client.get(f"/api/messages/{evil_pk}/reader").text),
+                            ("dashboard", client.get("/?view=all").text)):
+            check(f"  {where}: no runnable script tag",
+                  "<script>alert(1)</script>" not in html)
+            check(f"  {where}: no runnable event handler",
+                  'onerror="alert(2)"' not in html)
+            check(f"  {where}: it is escaped, not merely dropped",
+                  "&lt;script&gt;" in html)
 
         print("\nrelative dates")
         now = datetime.now()
