@@ -362,12 +362,7 @@ def create_app() -> FastAPI:
 
         groups: dict[str, list] = {t: [] for t in TIER_ORDER}
         for row in rows:
-            item = dict(row)
-            item["tier"] = tier_of(row["category"])
-            item["category_label"] = label_of(row["category"])
-            item["date_display"] = _fmt_date(row["date_utc"])
-            item["deadline_display"] = _fmt_deadline(row["deadline"])
-            item["open_url"], item["open_label"] = _open_link(row)
+            item = _decorate(row)
             groups[item["tier"]].append(item)
 
         return TEMPLATES.TemplateResponse(
@@ -375,6 +370,9 @@ def create_app() -> FastAPI:
             "dashboard.html",
             {
                 "page": "triage",
+                # Triage is the one page laid out in two panes; the rest are
+                # single-column reading width and must stay that way.
+                "main_class": "wide",
                 "view": view,
                 "groups": groups,
                 "tier_order": TIER_ORDER,
@@ -451,13 +449,35 @@ def create_app() -> FastAPI:
             "summary": summary,
         }
 
+    @app.get("/api/messages/{pk}/reader", response_class=HTMLResponse)
+    def api_message_reader(request: Request, pk: int):
+        """The right-hand pane for one message, rendered server-side.
+
+        Sending this with the page instead — a hidden block per row — put half
+        the document's bytes into detail for mail the reader looks at one at a
+        time, which is the same trade already rejected for bodies. Fetching it
+        on selection also keeps every formatted value coming from the same
+        template as the list, rather than being rebuilt in JavaScript.
+        """
+        with db.session() as conn:
+            row = db.get_triaged(conn, pk)
+            if not row:
+                return HTMLResponse("<p class=\"reader-placeholder\">No such message.</p>", 404)
+            state = _state(conn)
+        return TEMPLATES.TemplateResponse(
+            request,
+            "reader.html",
+            {"i": _decorate(row), "llm_ready": state["llm_ready"]},
+        )
+
     @app.get("/api/messages/{pk}/body")
     def api_message_body(pk: int):
-        """The stored body, fetched only when the user opens Details.
+        """The stored body on its own, as JSON.
 
-        Bodies are by far the largest column, and a list of 500 of them is most
-        of the dashboard's weight for something the reader looks at one at a
-        time — if at all.
+        The console no longer calls this — the reader fragment above arrives
+        with the body already in it, in one round trip instead of two. Kept
+        because it is the one way to read a stored body without asking for a
+        page of markup around it.
         """
         with db.session() as conn:
             body = db.get_message_body(conn, pk)
@@ -878,6 +898,21 @@ def _fmt_deadline(value: str | None) -> str:
     if days < 7:
         return f"Due in {days} days"
     return f"Due {_short_date(datetime.combine(due, datetime.min.time()))}"
+
+
+def _decorate(row) -> dict:
+    """Add the display-only fields the templates read.
+
+    Shared by the list and the reader so a date, a deadline or an open link is
+    formatted once, by one piece of code, however it reaches the page.
+    """
+    item = dict(row)
+    item["tier"] = tier_of(row["category"])
+    item["category_label"] = label_of(row["category"])
+    item["date_display"] = _fmt_date(row["date_utc"])
+    item["deadline_display"] = _fmt_deadline(row["deadline"])
+    item["open_url"], item["open_label"] = _open_link(row)
+    return item
 
 
 def _open_link(row) -> tuple[str | None, str]:

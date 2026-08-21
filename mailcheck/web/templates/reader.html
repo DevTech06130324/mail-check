@@ -1,0 +1,57 @@
+{# The right-hand pane for one message.
+
+   Served as a fragment by /api/messages/{pk}/reader and dropped into #reader,
+   rather than rendered into every row of the list: detail for 500 emails was
+   half the page's bytes, for something read one at a time. Every formatted
+   value here — dates, deadlines, confidence — still comes from the same
+   server-side helpers the list rows use, so the two can never disagree. #}
+<header class="reader-head">
+  <div class="mail-top">
+    <span class="chip">{{ i.category_label }}</span>
+    {% if i.deadline_display %}
+    <span class="due{% if 'Overdue' in i.deadline_display or i.deadline_display == 'Due today' %} urgent{% endif %}">
+      {{ i.deadline_display }}
+    </span>
+    {% endif %}
+    <span class="when">{{ i.date_display }}</span>
+    {% if i.handled_at %}<span class="done-flag">Done</span>{% endif %}
+  </div>
+  <h2 class="reader-subject">{{ i.subject }}</h2>
+  <p class="reader-from">
+    {%- if i.from_name %}{{ i.from_name }} &lt;{{ i.from_addr }}&gt;
+    {%- else %}{{ i.from_addr }}{% endif -%}
+  </p>
+</header>
+
+<div class="reader-actions">
+  {% if i.open_url %}
+  <a class="btn sm primary" href="{{ i.open_url }}" target="_blank" rel="noopener">
+    {{ i.open_label }}
+  </a>
+  {% endif %}
+  {% if i.handled_at %}
+  <button class="btn sm" onclick="setDone({{ i.pk }}, false, this)">Restore</button>
+  {% else %}
+  <button class="btn sm" onclick="setDone({{ i.pk }}, true, this)">Done</button>
+  {% endif %}
+  {% if i.category == 'unclassified' and llm_ready %}
+  <button class="btn sm" data-busy="Retrying…" onclick="reclassifyOne({{ i.pk }}, this)"
+          title="Ask the model again about just this email">Classify again</button>
+  {% endif %}
+</div>
+
+{% if i.summary %}<p class="reader-summary">{{ i.summary }}</p>{% endif %}
+
+<div class="reader-meta">
+  {% if i.company %}<div class="kv"><span>Company</span><span>{{ i.company }}</span></div>{% endif %}
+  {% if i.role %}<div class="kv"><span>Role</span><span>{{ i.role }}</span></div>{% endif %}
+  <div class="kv"><span>Account</span><span>{{ i.account_label }}</span></div>
+  {% if i.confidence and i.confidence < 0.5 %}
+  <div class="kv"><span>Confidence</span><span>Low ({{ (i.confidence * 100)|round|int }}%)</span></div>
+  {% endif %}
+  {% if i.source == 'prefilter' %}
+  <div class="kv"><span>Source</span><span>Local rule</span></div>
+  {% endif %}
+</div>
+
+<pre>{{ i.body_text or "(no body stored for this message)" }}</pre>

@@ -189,6 +189,8 @@ a:hover { text-decoration: underline; }
 @keyframes breathe { 50% { opacity: 0.25; } }
 
 main { max-width: 940px; margin: 0 auto; padding: 28px 24px 80px; }
+/* Triage is the one two-pane page; reading width would squeeze both. */
+main.wide { max-width: 1320px; }
 
 .page-head { margin-bottom: 22px; }
 h1 {
@@ -462,7 +464,7 @@ details.filters[open] > summary::after { content: "▴"; }
   transition: transform 0.16s var(--ease), box-shadow 0.16s var(--ease),
     opacity 0.2s var(--ease);
 }
-.mail:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+.mail:hover { background: var(--surface-sunk); }
 .mail.is-done { opacity: 0.6; }
 .mail.leaving {
   opacity: 0;
@@ -526,28 +528,6 @@ details.filters[open] > summary::after { content: "▴"; }
 .mail .when { margin-left: auto; font-size: 12.5px; color: var(--text-3); white-space: nowrap; }
 .mail .summary { margin: 6px 0 0; color: var(--text-2); overflow-wrap: anywhere; }
 
-.actions {
-  margin-top: 12px;
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-.actions .detail { margin-left: auto; }
-
-.mail details > summary {
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--text-2);
-  list-style: none;
-  user-select: none;
-  padding: 5px 4px;
-  border-radius: var(--r-sm);
-}
-.mail details > summary::-webkit-details-marker { display: none; }
-.mail details > summary::after { content: " ▾"; font-size: 10px; }
-.mail details[open] > summary::after { content: " ▴"; }
-.detail-body { margin-top: 8px; }
 .kv {
   display: flex;
   gap: 12px;
@@ -557,7 +537,7 @@ details.filters[open] > summary::after { content: "▴"; }
 }
 .kv > span:first-child { flex: 0 0 88px; color: var(--text-3); }
 .kv > span:last-child { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.mail pre {
+.reader pre {
   margin: 10px 0 0;
   padding: 12px 14px;
   background: var(--surface-sunk);
@@ -567,8 +547,174 @@ details.filters[open] > summary::after { content: "▴"; }
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 320px;
-  overflow: auto;
+  /* No max-height any more: the reader is itself a fixed-height scroller, and
+     capping the body inside it put a second scrollbar within the first — the
+     one you reach for is never the one that moves. The body flows and the
+     pane scrolls, once. */
+}
+
+/* --------------------------------------------------------------- split view */
+
+/* List left, reader right. The two panes scroll independently and each is
+   pinned to the viewport, so arrowing down a hundred emails never moves the
+   reader, and reading a long body never loses your place in the list. */
+.split {
+  display: grid;
+  grid-template-columns: minmax(300px, 380px) 1fr;
+  gap: 18px;
+  align-items: start;
+  /* Both panes must agree on these or they stop lining up, so they live in
+     one place. --pane-top clears the 52px sticky nav with room to breathe. */
+  --pane-top: 68px;
+  --pane-height: calc(100vh - var(--pane-top) - 28px);
+}
+.split[hidden] { display: none; }
+
+.mail-list {
+  position: sticky;
+  top: var(--pane-top);
+  max-height: var(--pane-height);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 8px 2px 2px;   /* room for the focus ring and the scrollbar */
+  margin: -2px 0;
+}
+.mail-list:focus { outline: none; }
+
+/* The reader borrows `tier` for its accent colours, which also brings that
+   rule's spacing along; inside a grid cell it is just a gap under the pane. */
+.reader.tier { margin-bottom: 0; }
+
+.reader {
+  position: sticky;
+  top: var(--pane-top);
+  /* A fixed height, not a maximum: sized to its content, the pane would jump
+     between a three-line rejection and a three-screen thread on every arrow
+     press. The one surface you actually read should hold still. */
+  height: var(--pane-height);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  padding: 20px 22px 24px;
+}
+
+/* The pane keeps the previous email until the next one arrives — dimmed, so
+   it never reads as the current selection. Locally this is a few milliseconds
+   and the transition barely starts; on a slow read it is the honest state. */
+.reader.is-loading { opacity: 0.5; }
+.reader { transition: opacity 0.15s var(--ease); }
+
+.reader-placeholder {
+  color: var(--text-3);
+  font-size: 14px;
+  padding: 28px 4px;
+  text-align: center;
+}
+
+.reader-head { border-bottom: 1px solid var(--separator); padding-bottom: 14px; }
+.reader-subject {
+  margin: 10px 0 0;
+  font-size: 20px;
+  font-weight: 640;
+  letter-spacing: -0.022em;
+  line-height: 1.28;
+  overflow-wrap: anywhere;
+}
+.reader-from {
+  margin: 5px 0 0;
+  font-size: 13px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.reader .done-flag {
+  padding: 2.5px 9px;
+  border-radius: 980px;
+  background: var(--info-bg);
+  color: var(--info);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.reader .when { margin-left: auto; font-size: 12.5px; color: var(--text-3); white-space: nowrap; }
+.reader .due {
+  padding: 2.5px 9px;
+  border-radius: 980px;
+  background: var(--reply-bg);
+  color: var(--reply);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.reader .due.urgent { background: var(--act-bg); color: var(--act); }
+
+.reader-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.reader-summary {
+  margin: 16px 0 0;
+  font-size: 14.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.reader-meta { margin-top: 14px; }
+
+/* ----------------------------------------------------------------- list rows */
+
+/* A row is a target, not a card: flat, tight, legible at a glance. The
+   selected one is the only thing on the page wearing the accent. */
+.mail { cursor: pointer; scroll-margin: 8px 0; }
+.mail.is-selected {
+  background: var(--accent-sunk, var(--surface-sunk));
+  box-shadow: 0 0 0 1.5px var(--accent) inset, var(--shadow-sm);
+}
+/* Keyboard focus keeps its ring — arrowing through the list is exactly when a
+   focus indicator earns its keep, and the selected tint alone is not one.
+   A mouse click gets the tint without the ring, which is what :focus-visible
+   already decides for us. */
+.mail:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mail:focus:not(:focus-visible) { outline: none; }
+
+/* ----------------------------------------------------------------- shortcuts */
+
+.shortcuts { margin: 14px 2px 0; font-size: 12.5px; color: var(--text-3); }
+.shortcuts[hidden] { display: none; }
+.shortcuts kbd {
+  display: inline-block;
+  min-width: 20px;
+  margin-right: 3px;
+  padding: 1.5px 5px;
+  border: 1px solid var(--separator-hi);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* One column once the two panes stop fitting: list first, reader under it,
+   both scrolling with the page rather than pinned. */
+@media (max-width: 900px) {
+  .split { grid-template-columns: 1fr; }
+  .mail-list, .reader {
+    position: static;
+    max-height: none;
+    height: auto;
+    overflow: visible;
+  }
+  .mail-list { padding: 0; margin: 0; }
+}
+
+/* No hover means no pointer, which means no arrow keys either — the hint is
+   not worth the space on a touch screen. */
+@media (hover: none) {
+  .shortcuts { display: none; }
 }
 
 /* ------------------------------------------------------------------ filters */

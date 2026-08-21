@@ -92,11 +92,14 @@ mail-check config show | set llm.batch_size 4 | set check.retain_days 30 | token
 Three pages, all of it local:
 
 - **Queue** (default) — only what needs you: unhandled interview invites, assessments,
-  offers, info requests and recruiter outreach. Each card leads with its category and
-  deadline, then company and role, then the mailbox it arrived in, then a one-line
-  summary, then two actions: **Open in Gmail/Outlook** and **Done**. Everything else is
-  behind Details.
-- **All mail** — the same cards, every category, grouped by urgency.
+  offers, info requests and recruiter outreach. The list is on the left and whatever is
+  selected opens on the right: subject and sender, the model's one-line summary, company,
+  role, account, and the cleaned body, with **Open in Gmail/Outlook** and **Done**. Each
+  row leads with its category and deadline, then company and role, then the mailbox it
+  arrived in, then the summary. Move with <kbd>↑</kbd> and <kbd>↓</kbd>, and press
+  <kbd>E</kbd> to mark the selected mail done — the selection lands on the next one, so a
+  full queue clears without touching the mouse.
+- **All mail** — the same list, every category, grouped by urgency.
 - **Completed** — what you've marked Done, with Restore.
 - **Accounts** — connect an IMAP mailbox with an app password, or sign in to a personal
   Outlook account with Microsoft. Test, pause, or remove any of them.
@@ -149,11 +152,16 @@ footer boilerplate, then truncated to 1200 characters. Known job-board senders a
 locally and never sent at all.
 
 Free models are unreliable at JSON, so the parser expects that: it strips code fences,
-pulls JSON out of surrounding prose, validates each item independently, retries missing
-items one at a time with a stricter prompt, and falls back to `unclassified` rather than
-crashing. One malformed entry cannot cost you the other seven.
+pulls JSON out of surrounding prose, accepts results either listed or keyed by id, and
+closes a reply that stopped mid-answer so the fields that did arrive still count. Each item
+is validated on its own; missing ones are retried singly with more room and a stricter
+prompt, and only then does it fall back to `unclassified`. One malformed entry cannot cost
+you the other seven.
 
-If you hit rate limits, lower the batch size:
+Most "free" models are reasoning models, and their thinking is charged against the same
+token budget as their answer — thinking about eight emails can cost ~1200 tokens before a
+character of JSON is written. The budgets here are sized for that. If a run reports items
+hitting the token limit, send fewer at a time:
 
 ```bash
 mail-check config set llm.batch_size 4

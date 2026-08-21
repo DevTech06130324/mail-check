@@ -48,7 +48,7 @@
 </script>
 </nav>
 
-<main id="main">
+<main id="main"{% if main_class %} class="{{ main_class }}"{% endif %}>
   {% block content %}{% endblock %}
 </main>
 

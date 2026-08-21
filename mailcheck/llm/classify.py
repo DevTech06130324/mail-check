@@ -2,11 +2,18 @@
 
 Order of attack, per §8 of the design:
   1. batch request, JSON mode
-  2. parse leniently (fences, prose-wrapped, alternate envelopes)
-  3. ids missing or invalid -> retry those individually with a stricter prompt
+  2. parse leniently (fences, prose-wrapped, alternate envelopes, cut-off JSON)
+  3. ids missing or invalid -> retry those individually, with more room and a
+     stricter prompt
   4. still missing -> `unclassified`, stored and surfaced, never silently dropped
 
 A batch never fails as a unit; one bad item cannot take down the other seven.
+
+The budgets below are sized for reasoning models, which is what a "free" model
+usually turns out to be. Their thinking is billed against `max_tokens` before a
+single character of the answer is written - measured at ~1200 reasoning tokens
+to think about a batch of eight - so a budget sized for the JSON alone buys a
+reply that stops mid-answer. Every number here is answer plus thinking.
 """
 
 from __future__ import annotations
@@ -21,6 +28,16 @@ from .prompt import STRICT_SUFFIX, SYSTEM, build_user_message
 from .schema import ItemResult, parse_results
 
 ProgressFn = Callable[[int, int], None]
+
+#: Per-message allowance for a batch call, plus a fixed slice for the envelope
+#: and the thinking that precedes it.
+_BATCH_TOKENS_PER_ITEM = 512
+_BATCH_TOKENS_BASE = 1024
+
+#: The single-message ladder: a normal budget, then a markedly larger one. An
+#: under-budgeted reply is a total loss, while an unused allowance costs
+#: nothing, so the second attempt buys room rather than just rewording.
+_SINGLE_TOKENS = (2048, 6144)
 
 
 def _to_classification(item: ItemResult) -> Classification:
@@ -46,12 +63,19 @@ def _unclassified(reason: str) -> Classification:
     )
 
 
+def _truncated(raw: object) -> bool:
+    """Did the model stop because it ran out of budget rather than ideas?"""
+    return getattr(raw, "finish_reason", None) == "length"
+
+
 def _classify_one(
     client: LLMClient, msg: NormalizedMessage, errors: list[str]
 ) -> Classification:
-    """Single-email fallback with the stricter prompt."""
-    for attempt in range(2):
+    """Single-email fallback: more room each pass, then a stricter prompt."""
+    cut_short = False
+    for attempt, budget in enumerate(_SINGLE_TOKENS):
         system = SYSTEM + (STRICT_SUFFIX if attempt else "")
+        raw = None
         try:
             raw = client.complete(
                 system,
@@ -59,7 +83,7 @@ def _classify_one(
                 # Second pass drops JSON mode: if the endpoint silently ignores
                 # it, the stricter wording is what actually helps.
                 json_mode=attempt == 0,
-                max_tokens=512,
+                max_tokens=budget,
             )
             results = parse_results(raw)
             item = results.get("1") or (next(iter(results.values())) if results else None)
@@ -67,7 +91,10 @@ def _classify_one(
                 return _to_classification(item)
         except (LLMError, ValueError) as exc:
             errors.append(f"{msg.subject[:40]!r}: {exc}")
-    return _unclassified("model output unparseable")
+        cut_short = cut_short or _truncated(raw)
+    return _unclassified(
+        "response cut off by the token limit" if cut_short else "model output unparseable"
+    )
 
 
 def _classify_batch(
@@ -84,8 +111,13 @@ def _classify_batch(
             # endpoint that mishandles response_format can have it turned off
             # from the start rather than only after a 400 forces a fallback.
             json_mode=None,
-            max_tokens=256 * len(batch) + 256,
+            max_tokens=_BATCH_TOKENS_PER_ITEM * len(batch) + _BATCH_TOKENS_BASE,
         )
+        if _truncated(raw):
+            errors.append(
+                f"batch of {len(batch)} hit the token limit; "
+                "recovering what arrived and retrying the rest singly"
+            )
         parsed = parse_results(raw)
     except (LLMError, ValueError) as exc:
         errors.append(f"batch of {len(batch)} failed: {exc}")

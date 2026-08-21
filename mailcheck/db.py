@@ -558,7 +558,8 @@ def query_triaged(
     """
     # ``body_text`` is deliberately not selected: full email bodies for every row
     # dominate both this result set and the HTML built from it, and the console
-    # only ever shows one at a time, on demand — see /api/messages/{pk}/body.
+    # only ever shows one at a time, on demand — see get_triaged() and the
+    # /api/messages/{pk}/reader fragment it feeds.
     sql = (
         """
         SELECT m.id AS pk, m.message_id, m.subject, m.from_addr, m.from_name,
@@ -591,6 +592,30 @@ def query_triaged(
            " ORDER BY m.date_utc DESC LIMIT ?"
     params.append(limit)
     return list(conn.execute(sql, params))
+
+
+def get_triaged(conn: sqlite3.Connection, pk: int) -> sqlite3.Row | None:
+    """One message with its latest classification, body included.
+
+    The list query deliberately leaves ``body_text`` out, because 500 full
+    bodies are most of a page's weight. This is the other half of that trade:
+    the reader asks for one message at a time and gets everything it needs to
+    render in a single round trip.
+    """
+    return conn.execute(
+        """
+        SELECT m.id AS pk, m.message_id, m.subject, m.from_addr, m.from_name,
+               m.date_utc, m.snippet, m.body_text, m.provider_url, m.handled_at,
+               a.label AS account_label, a.provider, a.imap_host,
+               c.category, c.confidence, c.company, c.role, c.deadline,
+               c.action_required, c.summary, c.source, c.created_at
+        FROM messages m
+        JOIN accounts a ON a.id = m.account_id
+        """
+        + LATEST_CLASSIFICATION
+        + " WHERE m.id = ?",
+        (pk,),
+    ).fetchone()
 
 
 def queue_counts(

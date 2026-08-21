@@ -199,13 +199,23 @@ so it gets an explicit ladder:
 1. Request `response_format: {"type": "json_object"}`; wrap results as `{"results": [...]}`
    because many endpoints reject a bare array root.
 2. Strip markdown fences; brace-match to extract the first balanced JSON object if the model
-   wraps it in prose.
-3. Validate each item with pydantic. Items that fail — or ids missing from the response — are
-   retried **individually** with a stricter prompt.
-4. Still failing after 2 attempts → `unclassified`, stored and shown in the report.
+   wraps it in prose. If nothing balances, close the open brackets and re-parse — a reply cut
+   off mid-answer still carries the items that arrived before the cut.
+3. Accept `results` either as a list or keyed by id; a reply that is merely the wrong shape
+   is not a failed reply.
+4. Validate each item with pydantic. Items that fail — or ids missing from the response — are
+   retried **individually**, with a larger token budget and then a stricter prompt.
+5. Still failing after 2 attempts → `unclassified`, stored and shown in the report, saying
+   whether the reply was cut short or simply unparseable.
 
 Unknown category strings are fuzzy-matched to the nearest known label, else `other`. A batch
 never fails as a unit; one bad item can't take down seven good ones.
+
+**Budget for thinking, not just answering.** Reasoning models spend `max_tokens` on their
+scratchpad before writing any answer — measured at ~1200 reasoning tokens for a batch of
+eight — so every budget here covers thinking plus answer. `finish_reason: "length"` is read
+back and reported as a token limit rather than as missing JSON, and buys a bigger budget on
+the retry instead of a reworded one.
 
 **Rate limits.** 429 → exponential backoff with jitter, honouring `Retry-After`. Concurrency
 defaults to 1 (free tiers are strict), configurable.
@@ -246,8 +256,9 @@ Terminal report groups by urgency tier, newest first, with a footer of run stats
 
 FastAPI + Jinja2, **bound to 127.0.0.1 only**, no auth (single local user). Reads the same
 SQLite DB. The default view is an action queue containing only unhandled **Act now** and
-**Needs a reply** messages. Each card exposes its primary actions directly: open the
-provider's original message or mark the item Done locally. Informational mail, noise, and
+**Needs a reply** messages, laid out as a list beside a reader for the selected message.
+The reader exposes the primary actions: open the provider's original message or mark the
+item Done locally. Informational mail, noise, and
 completed items are secondary views. Filters remain available without competing with the
 primary daily-triage path.
 
@@ -314,16 +325,25 @@ The default Triage view contains only unhandled `act` and `reply` items. Its hea
 combined actionable count and the last-check state. Large per-tier statistic tiles are
 replaced by a compact summary so an information-heavy inbox cannot dominate the first screen.
 
-Each mail card presents information in this order:
+The view is two panes: the list on the left, the selected message on the right. Triage is a
+repeated read-then-decide, so the list is a single tab stop that <kbd>↑</kbd>/<kbd>↓</kbd>
+move within, and <kbd>E</kbd> marks the selection done (and restores it on Completed, so the
+key is never dead). After a message leaves the list the selection lands on whatever took its
+place, so the loop continues without re-finding your position.
+
+Each row presents information in this order:
 
 1. urgency/category and deadline;
 2. company and role;
-3. one-line summary;
-4. primary actions: **Open in Gmail/Outlook** and **Done**;
-5. subject, sender, account, confidence, source, and cleaned body as secondary detail.
+3. the mailbox it arrived in;
+4. one-line summary.
 
-`For information` and `Noise` move to the All mail view. `Completed` is a separate view for
-locally handled messages. Filters are progressive disclosure, not the main navigation.
+The reader carries the rest — subject, sender, account, confidence, source, cleaned body —
+and the primary actions: **Open in Gmail/Outlook** and **Done**. It is fetched per message
+from `/api/messages/{pk}/reader` rather than rendered into every row: 500 hidden detail
+blocks were half the document's bytes, for something read one at a time. Rendering it
+server-side from the same helpers as the list keeps a date or a deadline from being
+formatted twice, by two different implementations.
 
 ### 15.3 Local Done and Undo
 

@@ -14,6 +14,7 @@ opt-in, since not every execution context has a usable credential store.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mailcheck import db, normalize, prefilter, report  # noqa: E402
 from mailcheck.config import Config, PrefilterRule  # noqa: E402
 from mailcheck.llm.classify import classify as run_classify  # noqa: E402
+from mailcheck.llm.client import Completion  # noqa: E402
 from mailcheck.llm.schema import parse_results  # noqa: E402
 from mailcheck.models import (  # noqa: E402
     Classification,
@@ -155,6 +157,12 @@ class FakeLLM:
         if self.mode == "dropped" and len(results) > 1:
             # Model silently omits one item — the single nastiest real failure.
             return json.dumps({"results": results[:-1]})
+        if self.mode == "truncated" and len(results) > 1:
+            # Reasoning burns the batch's token budget, so the reply stops
+            # partway through. Singles still fit, which is why the fallback
+            # rescues them.
+            whole = json.dumps({"results": results})
+            return Completion(whole[: int(len(whole) * 0.55)], "length")
         return json.dumps({"results": results})
 
 
@@ -218,6 +226,63 @@ def test_parsing():
     check("one bad item does not kill the batch", "0" in out and "3" in out, str(out.keys()))
     check("garbage confidence falls back", out["3"].confidence == 0.5)
 
+    print("\n  a reply that stopped short is repaired, not discarded")
+    # Every string here is a real reply from nemotron-3-ultra-free, which
+    # reasons against the same token budget it answers from and so keeps
+    # running out mid-answer. The category was always already there.
+    cut_off = {
+        "one closing brace short":
+            '{"results":{"1":{"id":"1","category":"application_ack","confidence":0.95,'
+            '"company":"Helsing","role":null,"deadline":null,"action_required":false,'
+            '"summary":"Application received and under review."}}',
+        "cut mid-string":
+            '{"results":{"1": {"id": "1", "category": "application_ack", "confidence": 0.95,'
+            ' "company": "Hebbia", "role": "Applied Research Engineer", "deadline": null,'
+            ' "action_required": false, "summary": "Applic',
+        "cut after a value":
+            '{"results": [{"id": "1", "category": "application_ack", "confidence": 0.95,'
+            ' "company": "Swift",',
+        "cut inside a key":
+            '{"results": [{"id": "1", "category": "application_ack", "confidence',
+        "cut after an escaped quote":
+            '{"results":[{"id":"1","category":"application_ack",'
+            '"summary":"they said \\"thanks\\" politely',
+    }
+    for name, raw in cut_off.items():
+        try:
+            out = parse_results(raw)
+            check(f"  {name}", out["1"].category == "application_ack", str(out.keys()))
+        except Exception as exc:  # noqa: BLE001
+            check(f"  {name}", False, str(exc))
+
+    later = parse_results(
+        '{"results":[{"id":"0","category":"rejection","confidence":0.9,"summary":"a"},'
+        '{"id":"1","category":"off'
+    )
+    check("  an earlier item survives a later one being cut", "0" in later, str(later.keys()))
+    check("  repair never invents a category",
+          parse_results('{"results": [{"id": "0",') == {})
+    for junk in ("The user wants me to classify this email. Let me analyze.",
+                 "<think>truncated rambling {half"):
+        try:
+            parse_results(junk)
+            check("  unusable prose still rejected", False, f"accepted {junk[:30]!r}")
+        except ValueError:
+            check("  unusable prose still rejected", True)
+
+    print("\n  results keyed by id instead of listed")
+    keyed = parse_results(json.dumps({"results": {
+        "0": {"id": "0", "category": "rejection"},
+        "1": {"id": "1", "category": "offer"},
+    }}))
+    check("  every item is recovered, not just the envelope",
+          sorted(keyed) == ["0", "1"], str(keyed.keys()))
+    check("  and mapped to the right categories",
+          keyed["0"].category == "rejection" and keyed["1"].category == "offer")
+    check("  a single object under the envelope still works",
+          parse_results(json.dumps({"results": {"id": "0", "category": "offer"}}))["0"].category
+          == "offer")
+
     print("\nfield coercion")
     check("label-cased category snaps", coerce_category("Interview Invite") == "interview_invite")
     check("hyphenated category snaps", coerce_category("job-alert") == "job_alert")
@@ -254,6 +319,34 @@ def test_classify_modes(msgs):
     check("  unclassified is flagged for manual review",
           all(r.action_required for r in results))
     check("  errors reported", len(errors) > 0)
+
+    print("\n  a batch that ran out of tokens")
+    fake = FakeLLM("truncated")
+    results, errors = run_classify(fake, live, batch_size=8)
+    check("every item still ends up classified",
+          all(r.category != UNCLASSIFIED for r in results), str([r.category for r in results]))
+    check("  the items that did arrive are read off the cut-off reply",
+          fake.calls < 1 + len(live), f"calls={fake.calls}")
+    check("  and the run says the limit was hit, not that JSON was missing",
+          any("token limit" in e for e in errors), str(errors))
+
+    class AlwaysCutOff:
+        """Never gets far enough to name a category, however much room it has."""
+
+        def __init__(self):
+            self.budgets = []
+
+        def complete(self, system, user, json_mode=None, max_tokens=2048):
+            self.budgets.append(max_tokens)
+            return Completion('{"results": [{"id": "1", "cate', "length")
+
+    stubborn = AlwaysCutOff()
+    results, errors = run_classify(stubborn, [live[0]], batch_size=1)
+    check("a reply that is cut off before the category is not guessed at",
+          results[0].category == UNCLASSIFIED)
+    check("  and says so plainly", "cut off" in results[0].summary, results[0].summary)
+    check("  the retry buys more room rather than repeating the same request",
+          stubborn.budgets[-1] > stubborn.budgets[0], str(stubborn.budgets))
 
 
 def test_pipeline_and_cache(msgs):
@@ -350,6 +443,7 @@ def test_sse_and_reasoning():
         check("reassembles split SSE deltas", '"category": "rejection"' in out, out)
         check("excludes reasoning_content", '"id":"9"' not in out, out)
         check("result parses", parse_results(out)["0"].category == "rejection")
+        check("carries why the model stopped", out.finish_reason == "stop", repr(out))
     finally:
         srv.shutdown()
 
@@ -430,7 +524,8 @@ def test_web_console(msgs):
         from mailcheck.web.app import create_app
 
         client = TestClient(create_app())
-        body = lambda r: r.text.split('<main id="main">')[1]
+        # Triage widens <main> with a class; every other page leaves it bare.
+        body = lambda r: re.split(r'<main id="main"[^>]*>', r.text)[1]
 
         for path in ("/", "/accounts", "/settings", "/static/app.css", "/static/app.js"):
             check(f"GET {path}", client.get(path).status_code == 200)
@@ -692,28 +787,25 @@ def test_action_queue(msgs):
 
         client = TestClient(create_app())
         # Scope to the card list: the filter dropdown always names every category.
-        cards = lambda r: r.text.split('<div id="queue">')[1].split('<div class="empty"')[0]
+        cards = lambda r: r.text.split('id="queue"')[1].split('<div class="empty"')[0]
+        # The right-hand pane is fetched per message rather than rendered into
+        # every row, so assertions about detail go to the fragment.
+        reader_of = lambda pk: client.get(f"/api/messages/{pk}/reader").text
 
         check("default view is the queue", 'class="tier act"' in cards(client.get("/")))
         check("  informational is excluded", 'class="tier info"' not in cards(client.get("/")))
         check("All mail includes informational",
               'class="tier info"' in cards(client.get("/?view=all")))
         check("Completed view renders", client.get("/?view=completed").status_code == 200)
-        check("cards carry Done and an open link",
-              ">Done<" in cards(client.get("/")) and "Open in Gmail" in cards(client.get("/")))
+        check("the reader carries Done and an open link",
+              ">Done<" in reader_of(pks[0]) and "Open in Gmail" in reader_of(pks[0]))
         check("active view marked with aria-current",
               'aria-current="page"' in client.get("/").text)
 
-        # Which mailbox a message arrived in has to be readable without opening
-        # anything, so every assertion here runs against the card with its
-        # <details> block stripped out — the account living only inside Details
-        # is exactly the bug this guards against.
-        import re
-
-        strip_details = lambda html: re.sub(
-            r'<details class="detail">.*?</details>', "", html, flags=re.S)
-
-        faces = strip_details(cards(client.get("/")))
+        # Which mailbox a message arrived in has to be readable without
+        # selecting anything, so these run against the list rows themselves —
+        # the account living only in the reader is the bug this guards against.
+        faces = cards(client.get("/"))
         labels = faces.count('class="acct"')
         articles = faces.count('<article class="mail')
         check("the account is on the card face, not only behind Details",
@@ -730,14 +822,13 @@ def test_action_queue(msgs):
             r'[^<]*</span>\s*<p class="summary">', faces, flags=re.S))
         check("  between the headline and the summary", placed == articles,
               "%d placed for %d cards" % (placed, articles))
-        check("  All mail too",
-              'class="acct"' in strip_details(cards(client.get("/?view=all"))))
+        check("  All mail too", 'class="acct"' in cards(client.get("/?view=all")))
 
         check("mark Done over the API",
               client.post(f"/api/messages/{pks[0]}/handled?done=true").json()["done"] is True)
         check("  queue drops it", "Interview invite" not in cards(client.get("/")))
-        check("  Completed offers Restore",
-              ">Restore<" in cards(client.get("/?view=completed")))
+        check("  the reader offers Restore once an email is done",
+              ">Restore<" in reader_of(pks[0]))
         check("Undo over the API",
               client.post(f"/api/messages/{pks[0]}/handled?done=false").json()["ok"])
         check("  it is back in the queue", "Interview invite" in cards(client.get("/")))
@@ -793,6 +884,54 @@ def test_action_queue(msgs):
         allmail = cards(client.get("/?view=all"))
         check("same in All mail",
               allmail.count('class="tier-head"') == allmail.count('<section class="tier'))
+
+        print("\nsplit layout: list left, reader right")
+        page = client.get("/?view=all").text
+        listing = page.split('id="queue"')[1].split('id="reader"')[0]
+        check("the list and the reader are both rendered",
+              'class="split"' in page and 'id="reader"' in page)
+        check("  the reader starts as a placeholder, not a copy of the first email",
+              'class="reader-placeholder"' in page)
+
+        rowcount = listing.count('<article class="mail')
+        check("  every row carries the key its reader is built from",
+              listing.count("data-pk=") == rowcount and listing.count("data-tier=") == rowcount,
+              f"{rowcount} rows")
+        check("  and the reader is fetched, not folded into every row",
+              "reader-subject" not in listing and "reader-head" not in listing)
+        first = re.search(r'data-pk="(\d+)"', listing).group(1)
+        pane = client.get(f"/api/messages/{first}/reader")
+        check("  the fragment renders the pane server-side",
+              pane.status_code == 200 and 'class="reader-subject"' in pane.text)
+        check("  a message that does not exist is a 404, not a blank pane",
+              client.get("/api/messages/999999/reader").status_code == 404)
+
+        # One tab stop for the whole list, then the arrow keys. Rendered
+        # server-side so Tab reaches the list before any script has run.
+        tabstops = re.findall(r'tabindex="(-?\d)"', listing)
+        check("  the list is a single tab stop",
+              tabstops.count("0") == 1 and len(tabstops) == rowcount, str(tabstops))
+
+        # Actions belong to the reader, which is one set of controls however
+        # long the list gets — not one set per row.
+        faces = listing
+        check("  the row itself offers no buttons to tab through",
+              "<button" not in faces and 'class="btn' not in faces, faces[:200])
+        check("  while the reader has Done and the open link",
+              ">Done<" in pane.text and "Open in Gmail" in pane.text)
+
+        check("the shortcuts are stated on the page, not left to be guessed",
+              "<kbd>E</kbd>" in page and "mark done" in page)
+        check("  and Completed names what E does there instead",
+              "restore" in client.get("/?view=completed&days=90").text.lower())
+
+        # Nothing to show: the two panes would otherwise render as an empty box
+        # beside a placeholder, on top of the empty state.
+        blank = client.get("/?view=all&category=offer").text
+        check("an empty view hides the split entirely",
+              '<div class="split" hidden>' in blank)
+        check("  and drops the shortcut hint with it",
+              'class="shortcuts"' not in blank)
 
         print("\nbrowser notifications")
         got = client.get("/api/notifications").json()
@@ -919,7 +1058,7 @@ def test_review_fixes(msgs):
         check("queue_counts treats unclassified as actionable", counts["actionable"] == 1, str(counts))
 
         client = TestClient(create_app())
-        queue_html = client.get("/").text.split('<div id="queue">')[1]
+        queue_html = client.get("/").text.split('id="queue"')[1]
         check("unclassified mail appears in the default queue view",
               "Needs a manual look" in queue_html)
     finally:
@@ -1442,8 +1581,14 @@ def test_lazy_bodies_and_inplace_done(msgs):
         # "Hi David" is body-only text; the summary and snippet do not carry it.
         check("full bodies are not inlined into the page",
               "Hi David" not in html, html[:0])
-        check("  the body placeholder is wired to the message",
-              f'data-body="{pk}"' in html)
+        check("  nor is the detail pane, which is fetched per message",
+              "reader-subject" not in html)
+
+        pane = client.get(f"/api/messages/{pk}/reader")
+        check("the reader fragment carries the body",
+              pane.status_code == 200 and "Hi David" in pane.text)
+        check("  unknown message -> 404",
+              client.get("/api/messages/9999/reader").status_code == 404)
 
         body = client.get(f"/api/messages/{pk}/body")
         check("the body endpoint serves it on demand",

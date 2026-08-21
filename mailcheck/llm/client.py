@@ -23,6 +23,24 @@ class RateLimited(LLMError):
         self.retry_after = retry_after
 
 
+class Completion(str):
+    """The reply text, carrying why the model stopped.
+
+    A ``str`` subclass rather than a wrapper so every existing caller - and
+    every test double that just returns a plain string - keeps working. Read it
+    with ``getattr(raw, "finish_reason", None)``: ``"length"`` means the budget
+    ran out mid-answer, which is worth a retry with more room rather than the
+    same request again.
+    """
+
+    finish_reason: str | None
+
+    def __new__(cls, text: str, finish_reason: str | None = None) -> "Completion":
+        obj = super().__new__(cls, text)
+        obj.finish_reason = finish_reason
+        return obj
+
+
 def _endpoint(base_url: str) -> str:
     base = base_url.strip().rstrip("/")
     if base.endswith("/chat/completions"):
@@ -73,7 +91,7 @@ class LLMClient:
 
     def complete(
         self, system: str, user: str, *, json_mode: bool | None = None, max_tokens: int = 2048
-    ) -> str:
+    ) -> Completion:
         """``json_mode=None`` (the default) defers to ``self.use_json_mode`` —
         the configured ``llm.use_json_mode`` setting. Pass an explicit bool to
         override it for one call, as the retry ladder in classify.py does."""
@@ -110,7 +128,7 @@ class LLMClient:
                 time.sleep(_backoff(attempt))
         raise LLMError(f"Gave up after {self.max_retries} attempts: {last_error}")
 
-    def _once(self, payload: dict) -> str:
+    def _once(self, payload: dict) -> Completion:
         resp = self._client.post(self.url, json=payload)
         if resp.status_code == 429:
             raise RateLimited(_retry_after(resp))
@@ -126,15 +144,15 @@ class LLMClient:
         if "text/event-stream" in resp.headers.get("content-type", "") or body.lstrip().startswith(
             "data:"
         ):
-            content = _collect_sse(body)
+            content, finish = _collect_sse(body)
             if not content:
-                raise LLMError(f"Stream carried no content: {body[:200]}")
-            return content
+                raise LLMError(f"Stream carried no content: {body[:600]}")
+            return Completion(content, finish)
 
         try:
             data = resp.json()
         except ValueError as exc:
-            raise LLMError(f"Non-JSON response from {self.url}: {body[:200]}") from exc
+            raise LLMError(f"Non-JSON response from {self.url}: {body[:600]}") from exc
 
         if "error" in data and not data.get("choices"):
             raise LLMError(f"API error: {data['error']}")
@@ -145,9 +163,9 @@ class LLMClient:
         content = (choice.get("message") or choice.get("delta") or {}).get("content")
         if not content:
             raise LLMError("Model returned empty content")
-        return content
+        return Completion(content, choice.get("finish_reason"))
 
-    def ping(self) -> str:
+    def ping(self) -> Completion:
         """Cheap round-trip used by `mail-check init` to validate settings."""
         return self.complete(
             "You are a health check. Reply with JSON only.",
@@ -157,14 +175,16 @@ class LLMClient:
         )
 
 
-def _collect_sse(body: str) -> str:
+def _collect_sse(body: str) -> tuple[str, str | None]:
     """Reassemble the text from an SSE chat-completion stream.
 
     Only `delta.content` is kept: reasoning models also emit `reasoning_content`
     or `thinking` deltas, which are not part of the answer and would corrupt the
-    JSON we are trying to parse.
+    JSON we are trying to parse. Returns the text and the last finish_reason
+    seen, so a stream cut short by the token budget is still recognisable.
     """
     parts: list[str] = []
+    finish: str | None = None
     for line in body.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -181,7 +201,9 @@ def _collect_sse(body: str) -> str:
             piece = node.get("content")
             if piece:
                 parts.append(piece)
-    return "".join(parts)
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+    return "".join(parts), finish
 
 
 def _retry_after(resp: httpx.Response) -> float | None:
