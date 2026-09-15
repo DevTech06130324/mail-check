@@ -1634,6 +1634,131 @@ def test_lazy_bodies_and_inplace_done(msgs):
         cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token = orig
 
 
+def test_body_rendering():
+    """The reader's body: readable structure out of html2text's plain text.
+
+    Every string below is a shape taken from real stored mail, with the counts
+    that justified handling it at all measured across 800 bodies.
+    """
+    from mailcheck.web.bodyhtml import render_body
+
+    r = lambda t: str(render_body(t))
+
+    print("\nmessage body -> readable HTML")
+    check("blank lines become paragraphs (96% of bodies)",
+          r("Hi David,\n\nThanks for applying.") ==
+          "<p>Hi David,</p><p>Thanks for applying.</p>")
+    check("  a single newline stays inside its paragraph",
+          r("Regards,\nThe Team") == "<p>Regards,<br>The Team</p>")
+
+    print("\n  links")
+    check("a bare URL becomes a link",
+          '<a href="https://example.com/careers"' in r("See https://example.com/careers now"))
+    check("  opened safely, in a new tab",
+          'target="_blank" rel="noopener noreferrer"' in r("https://example.com"))
+    check("  html2text's <url> form loses its brackets",
+          r("Apply <https://x.com/j>").count("&lt;") == 0)
+    check("  a Markdown link keeps its words, not its syntax",
+          r("[Complete the test](https://h.com/t) by Friday") ==
+          '<p><a href="https://h.com/t" target="_blank" rel="noopener noreferrer">'
+          'Complete the test</a> by Friday</p>')
+    check("  an empty label falls back to the title html2text carried over",
+          ">BambooHR</a>" in r('[ ](https://bamboohr.com "BambooHR")'))
+    check("  mailto is a link too, shown as the address",
+          '<a href="mailto:hr@acme.com"' in r("[write](mailto:hr@acme.com)") and
+          ">hr@acme.com</a>" in r("Reach mailto:hr@acme.com today"))
+    check("  a long URL is shown as its host, but still goes to the full address",
+          ">www.ziprecruiter.com/…</a>" in
+          r("Go to https://www.ziprecruiter.com/ekm/AAFBoIoIjSt6nlLq7J6XMSyFqKga2wGtYg now"))
+    check("  a sentence keeps its full stop",
+          r("Visit https://x.com.").endswith("</a>.</p>"))
+
+    # clean_text truncates URLs past 90 chars, so a third of stored bodies hold
+    # an address that no longer resolves. A link that cannot be followed is
+    # worse than text that admits it.
+    print("\n  addresses the store already truncated (32% of bodies)")
+    cut = r("Click <https://www.ziprecruiter.com/km/AAHtHJaAZf-EVCXCazktCWrPx7OY0f7Ib...")
+    check("a shortened address is not offered as a link",
+          "<a " not in cut and 'class="rb-dead"' in cut)
+    check("  and says why",
+          "no longer complete" in cut)
+    check("  a Markdown link cut mid-address keeps its words, not its brackets",
+          r("opens up to [25,000 recruiters](https://t.ladders.co/f/a/bMyAvfUCmw...") ==
+          '<p>opens up to <span class="rb-dead" title="This address was shortened when '
+          'the message was stored, so it is no longer complete">25,000 recruiters</span></p>')
+
+    print("\n  html2text artefacts")
+    check("layout-table pipes are stripped, the words kept (12% of bodies)",
+          r("|\n|  |  |\n|  Curated access to 200,000+ jobs\n|  |") ==
+          "<p>Curated access to 200,000+ jobs</p>")
+    check("  a table's separator row is scaffolding, not content",
+          r("Head\n\n---|---\n\n| a | b |") == "<p>Head</p><p>a  b</p>")
+    check("  rules that separate nothing are dropped",
+          r("Top\n\n---\n\n---\n\nBottom\n\n---") == "<p>Top</p><hr><p>Bottom</p>")
+    check("  an image's alt text is kept but set back (32% of bodies)",
+          r("[Raytheon]") == '<p class="rb-alt">Raytheon</p>')
+    check("  bullets become a list (8% of bodies)",
+          r("* Complete the test\n* Send references") ==
+          "<ul><li>Complete the test</li><li>Send references</li></ul>")
+
+    print("\n  artefacts only real mail exposed")
+    check("a query-only address is not mistaken for a long path",
+          ">brighthire.ai/…</a>" in
+          r("Go to https://brighthire.ai?utm_campaign=email&utm_medium=email now"))
+    check("  an address that links to itself is shown once, not twice",
+          r("contact a@b.com<mailto:a@b.com> today") ==
+          '<p>contact <a href="mailto:a@b.com" target="_blank" rel="noopener noreferrer">'
+          'a@b.com</a> today</p>')
+    check("  a bracket orphaned by a cut address does not leak (9% of bodies)",
+          r("[https://firebasestorage.googleapis.com/v0/b/xyz/o/logo%2Fimg...")
+          .startswith('<p><span class="rb-dead"'))
+
+    print("\n  emphasis the sender typed")
+    check("*word* becomes emphasis",
+          r("*Good luck!*") == "<p><em>Good luck!</em></p>")
+    check("  **word** becomes strong",
+          r("This is **important**") == "<p>This is <strong>important</strong></p>")
+    check("  arithmetic is left alone",
+          r("5 * 3 * 2 = 30") == "<p>5 * 3 * 2 = 30</p>")
+    check("  and a bullet's leader is still a bullet",
+          r("* Do the test") == "<ul><li>Do the test</li></ul>")
+
+    print("\n  hostile mail cannot execute")
+    # The result is marked safe and written into the page with innerHTML, so
+    # what this module emits is the only thing between a stranger's email and
+    # script execution. Asserting on the tags it produced, rather than
+    # substring-hunting the text: escaped prose legitimately still reads
+    # "onerror=", and a test that trips on that would teach nothing.
+    allowed_tags = {"p", "br", "ul", "li", "hr", "a", "span", "/p", "/ul", "/li", "/a", "/span"}
+
+    def emitted_tags(out):
+        return [t.strip("<>").split()[0].lower() for t in re.findall(r"<[^>]+>", out)]
+
+    hostile = [
+        "<script>alert(1)</script>",
+        "<img src=x onerror=alert(1)>",
+        "<iframe src=//evil.com></iframe>",
+        "[click](javascript:alert(1))",
+        "[click](data:text/html,<script>x</script>)",
+        '[a](https://x.com" onmouseover="alert(1))',
+        "<svg/onload=alert(1)>",
+        "]]><script>alert(1)</script>",
+    ]
+    for evil in hostile:
+        out = r(evil)
+        tags = emitted_tags(out)
+        check(f"  only known tags survive {evil[:28]!r}",
+              set(tags) <= allowed_tags, str(sorted(set(tags) - allowed_tags)))
+        check("    no event handler reaches attribute position",
+              not re.search(r"<[a-z]+[^>]*\son[a-z]+\s*=", out, re.I), out)
+        check("    every href is a scheme we chose",
+              all(h.startswith(("https://", "http://", "mailto:"))
+                  for h in re.findall(r'href="([^"]*)"', out)), out)
+
+    check("an empty body renders as nothing, for the caller to explain",
+          r("") == "" and r("   \n\n ") == "")
+
+
 def test_config_cache():
     """The status poll reads the config about once a second; it must not re-read
     the file each time, and must never hand back a shared mutable instance."""
@@ -1680,6 +1805,92 @@ def test_config_cache():
               str(cfgmod.Config().check.lookback_days))
     finally:
         cfgmod.config_path = orig
+
+
+def test_undo(msgs):
+    """Ctrl+Z takes back the last Done.
+
+    The console undoes from its own in-page history, which is exact and needs
+    no round trip — that part is JavaScript and is not exercised here. What is
+    tested is the fallback underneath it: a finished check reloads the page and
+    takes that history with it, and undo must not quietly stop meaning anything
+    because the tab was rebuilt.
+    """
+    import tempfile as tf
+    from pathlib import Path
+
+    import mailcheck.config as cfgmod
+    import mailcheck.secrets as secmod
+    from fastapi.testclient import TestClient
+
+    from mailcheck.web.app import create_app
+
+    print("\nundo the last Done")
+    tmp = Path(tf.mkdtemp())
+    orig = (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token)
+    cfgmod.db_path = lambda: tmp / "t.db"
+    cfgmod.config_path = lambda: tmp / "config.toml"
+    secmod.has_llm_token = lambda: True
+    try:
+        with db.session() as conn:
+            db.add_account(conn, label="gmail", email="a@gmail.com",
+                           imap_host="imap.gmail.com")
+            acc = db.get_account(conn, "gmail")
+            pks = []
+            for n, subject in enumerate(("First invite", "Second invite", "Third invite")):
+                m = NormalizedMessage(
+                    account_id=acc.id, account_label="gmail", message_id=f"u{n}",
+                    uid=str(n), folder="INBOX", from_addr="r@acme.com",
+                    from_name="Recruiter", subject=subject,
+                    date_utc=datetime.now(timezone.utc), body="Body", provider_url=None)
+                pk = db.upsert_message(conn, m)
+                pks.append(pk)
+                db.save_classification(conn, pk, Classification(
+                    category="interview_invite", confidence=0.9, company="Acme",
+                    role="Engineer", deadline=None, action_required=True,
+                    summary="s", source="llm"), "model", "1")
+
+        client = TestClient(create_app())
+        check("with nothing done, undo says so rather than erroring",
+              client.post("/api/messages/undo-last").json()["pk"] is None)
+
+        client.post(f"/api/messages/{pks[0]}/handled?done=true")
+        client.post(f"/api/messages/{pks[1]}/handled?done=true")
+        check("  two done, one left in the queue",
+              client.get("/").text.count('<article class="mail') == 1)
+
+        first = client.post("/api/messages/undo-last").json()
+        check("undo takes back the most recent Done, not the oldest",
+              first["pk"] == pks[1], f'{first["pk"]} != {pks[1]}')
+        check("  and names what came back",
+              "Second invite" in first["message"], first["message"])
+        check("  with fresh counts for the badges",
+              set(first["summary"]) == {"actionable", "informational", "done"})
+
+        second = client.post("/api/messages/undo-last").json()
+        check("  pressing it again walks further back",
+              second["pk"] == pks[0], f'{second["pk"]} != {pks[0]}')
+        check("  the queue is whole again",
+              client.get("/").text.count('<article class="mail') == 3)
+        check("  and a third press has nothing left to do",
+              client.post("/api/messages/undo-last").json()["pk"] is None)
+
+        # Restoring is the same write Done uses, so it must leave no trace.
+        with db.session() as conn:
+            rows = db.query_triaged(conn, handled=True)
+        check("  nothing is left marked done", rows == [], str(len(rows)))
+
+        page = client.get("/").text
+        check("the shortcut is advertised, not left to be discovered",
+              "<kbd>Ctrl</kbd><kbd>Z</kbd>" in page and "undo" in page)
+        check("  and the page binds it",
+              'e.key === "z"' in page and "undoLast()" in page)
+        check("  while leaving redo alone",
+              "!e.shiftKey" in page)
+        check("  and never stealing undo from a field",
+              "input, select, textarea" in page)
+    finally:
+        cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token = orig
 
 
 def test_retention():
@@ -1797,9 +2008,11 @@ def main() -> int:
     test_schedule()
     test_action_queue(msgs)
     test_review_fixes(msgs)
+    test_body_rendering()
     test_config_cache()
     test_lazy_bodies_and_inplace_done(msgs)
     test_reclassify(msgs)
+    test_undo(msgs)
     test_retention()
     print(f"\n{PASS} passed, {FAIL} failed")
     print(

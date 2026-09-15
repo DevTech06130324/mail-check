@@ -190,7 +190,9 @@ a:hover { text-decoration: underline; }
 
 main { max-width: 940px; margin: 0 auto; padding: 28px 24px 80px; }
 /* Triage is the one two-pane page; reading width would squeeze both. */
-main.wide { max-width: 1320px; }
+/* Wider and tighter than a reading page: this one is a workspace, and the
+   space belongs to the two panes rather than to the margins. */
+main.wide { max-width: 1500px; padding: 18px 20px 20px; }
 
 .page-head { margin-bottom: 22px; }
 h1 {
@@ -415,6 +417,53 @@ details.filters[open] > summary::after { content: "▴"; }
 }
 .filter-row select { width: auto; min-width: 0; flex: 0 1 auto; }
 
+
+/* ------------------------------------------------------------- triage head */
+
+/* Everything above the panes, on one line. The headline, the view tabs, the
+   filter disclosure and the shortcut hint were four stacked blocks costing
+   ~155px before any mail appeared — a quarter of a laptop window spent on
+   chrome, on a page whose whole job is the mail underneath it. */
+.triage-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.triage-head h1 {
+  font-size: 21px;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+/* The auto margin goes on the tabs, so everything after them is pushed to the
+   far end — and it stays right whether or not the hint is rendered, which the
+   empty views do not render at all. */
+.triage-head .views {
+  margin: 0 auto 0 0;
+  padding-bottom: 0;
+  overflow: visible;
+}
+.triage-head details.filters { margin-bottom: 0; }
+.triage-head .shortcuts { margin: 0; }
+
+/* Open, the filters take a line of their own rather than squeezing the row. */
+.triage-head details.filters[open] {
+  flex-basis: 100%;
+  margin-left: 0;
+  order: 1;
+}
+
+/* Its own line, under everything: it carries live progress during a check, so
+   it has to be present, but it is the least of what this row is for. */
+.triage-head #status-line {
+  flex-basis: 100%;
+  order: 2;
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
 /* -------------------------------------------------------------- mail cards */
 
 .tier { margin-bottom: 30px; }
@@ -537,20 +586,68 @@ details.filters[open] > summary::after { content: "▴"; }
 }
 .kv > span:first-child { flex: 0 0 88px; color: var(--text-3); }
 .kv > span:last-child { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.reader pre {
-  margin: 10px 0 0;
-  padding: 12px 14px;
-  background: var(--surface-sunk);
-  border-radius: var(--r);
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-  /* No max-height any more: the reader is itself a fixed-height scroller, and
-     capping the body inside it put a second scrollbar within the first — the
-     one you reach for is never the one that moves. The body flows and the
-     pane scrolls, once. */
+/* ------------------------------------------------------------- message body */
+
+/* A letter, not a stack trace. The body used to be a 12px monospace block on a
+   sunken panel — code-font prose, paragraph breaks indistinguishable from line
+   wraps, and every link inert. It is the thing you are here to read, so it
+   gets the page's text font, a real reading measure, and working links. */
+.reader-body {
+  flex: 1 1 auto;
+  min-height: 160px;
+  overflow: auto;
+  margin-top: 16px;
+  padding-top: 4px;
+  font-size: 14.5px;
+  line-height: 1.62;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.reader-body > :first-child { margin-top: 0; }
+.reader-body p { margin: 0 0 0.85em; }
+.reader-body > :last-child { margin-bottom: 0; }
+
+.reader-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.reader-body ul {
+  margin: 0 0 0.85em;
+  padding-left: 1.25em;
+}
+.reader-body li { margin: 0.2em 0; }
+
+.reader-body hr {
+  height: 1px;
+  margin: 1.1em 0;
+  border: 0;
+  background: var(--separator);
+}
+
+/* A heading html2text carried over from the original markup. */
+.reader-body .rb-head {
+  margin: 1.1em 0 0.4em;
+  font-weight: 640;
+  letter-spacing: -0.01em;
+}
+
+/* An image's alt text, standing alone on a line — and the "no body" note.
+   Present, because it sometimes names the company, but never competing with
+   the words a person actually wrote. */
+.reader-body .rb-alt {
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+/* An address that clean_text shortened past the point of working. Marked as
+   text you cannot follow rather than a link that would fail. */
+.reader-body .rb-dead {
+  color: var(--text-3);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
 }
 
 /* --------------------------------------------------------------- split view */
@@ -560,19 +657,20 @@ details.filters[open] > summary::after { content: "▴"; }
    reader, and reading a long body never loses your place in the list. */
 .split {
   display: grid;
-  grid-template-columns: minmax(300px, 380px) 1fr;
+  grid-template-columns: minmax(260px, 380px) 1fr;
   gap: 18px;
   align-items: start;
-  /* Both panes must agree on these or they stop lining up, so they live in
-     one place. --pane-top clears the 52px sticky nav with room to breathe. */
-  --pane-top: 68px;
-  --pane-height: calc(100vh - var(--pane-top) - 28px);
+  /* How tall the panes are. sizePanes() measures this properly once the page
+     has laid out, because how far down the split starts depends on the
+     banners and filters above it. This is only the value used before that
+     runs, and if scripting is off — conservative on purpose, since a pane
+     that is too short merely scrolls, while one that is too tall hangs off
+     the bottom of the window. */
+  --pane-height: max(320px, calc(100vh - 165px));
 }
 .split[hidden] { display: none; }
 
 .mail-list {
-  position: sticky;
-  top: var(--pane-top);
   max-height: var(--pane-height);
   overflow-y: auto;
   /* Explicit, because setting only overflow-y makes the other axis `auto` too
@@ -590,12 +688,16 @@ details.filters[open] > summary::after { content: "▴"; }
 .reader.tier { margin-bottom: 0; }
 
 .reader {
-  position: sticky;
-  top: var(--pane-top);
   /* A fixed height, not a maximum: sized to its content, the pane would jump
      between a three-line rejection and a three-screen thread on every arrow
      press. The one surface you actually read should hold still. */
   height: var(--pane-height);
+  /* A column, so the body below can claim whatever height is left over. The
+     pane keeps its own overflow as a safety valve: if an email carries enough
+     metadata to squeeze the body past its floor, the pane scrolls rather than
+     clipping something the reader can never reach. */
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
   overscroll-behavior: contain;
   background: var(--surface);
@@ -610,7 +712,11 @@ details.filters[open] > summary::after { content: "▴"; }
 .reader.is-loading { opacity: 0.5; }
 .reader { transition: opacity 0.15s var(--ease); }
 
+/* Everything except the body keeps its natural height. */
+.reader > * { flex: 0 0 auto; }
+
 .reader-placeholder {
+  margin: auto;            /* centred in the empty pane, not stuck at the top */
   color: var(--text-3);
   font-size: 14px;
   padding: 28px 4px;
@@ -702,9 +808,14 @@ details.filters[open] > summary::after { content: "▴"; }
   text-align: center;
 }
 
-/* One column once the two panes stop fitting: list first, reader under it,
-   both scrolling with the page rather than pinned. */
-@media (max-width: 900px) {
+/* One column once the two panes genuinely stop fitting.
+
+   Worked out rather than guessed: the reader needs ~340px to be worth reading
+   and the list ~260px, plus an 18px gap and 48px of page padding — so the
+   split still earns its keep down to about 670px. The first version collapsed
+   at 900px, which threw the layout away on any window under half a 1080p
+   screen, including a browser docked in an editor panel. */
+@media (max-width: 700px) {
   .split { grid-template-columns: 1fr; }
   .mail-list, .reader {
     position: static;

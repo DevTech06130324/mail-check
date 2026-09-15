@@ -35,6 +35,7 @@ from ..taxonomy import (
     label_of,
     tier_of,
 )
+from . import bodyhtml
 
 #: Tiers that make up the daily action queue. A failed classification
 #: (``unclassified``) is exactly the kind of thing that must not go unseen, so
@@ -44,6 +45,28 @@ ACTIONABLE_CATEGORIES = [c.name for c in CATEGORIES if c.tier in ACTIONABLE_TIER
 
 HERE = Path(__file__).parent
 TEMPLATES = Jinja2Templates(directory=str(HERE / "templates"))
+
+
+def _asset_version() -> str:
+    """Newest mtime across the static files, as a cache-busting stamp.
+
+    The stylesheet and the script are served without a Cache-Control header, so
+    a browser is free to reuse whatever it already has — which during any UI
+    work means an old layout rendered over new markup, and no way to tell that
+    from a bug. Stamping the URL makes an edited file a different URL, and the
+    question stops coming up.
+    """
+    newest = max(
+        (f.stat().st_mtime for f in (HERE / "static").glob("*") if f.is_file()),
+        default=0.0,
+    )
+    return str(int(newest))
+
+
+#: The function, not its result: a stylesheet edited while the server is up
+#: is exactly when a stale copy is most confusing, and a few stat() calls
+#: per render cost nothing on a single-user local app.
+TEMPLATES.env.globals["asset_v"] = _asset_version
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
@@ -449,6 +472,29 @@ def create_app() -> FastAPI:
             "summary": summary,
         }
 
+    @app.post("/api/messages/undo-last")
+    def api_undo_last():
+        """Restore the most recently completed message.
+
+        The console undoes from its own in-page history, which is exact and
+        needs no round trip. This is the fallback for when that history is
+        gone — a finished check reloads the page — so that Ctrl+Z keeps
+        working rather than silently doing nothing.
+        """
+        with db.session() as conn:
+            row = db.last_handled(conn)
+            if not row:
+                return {"ok": True, "pk": None, "message": "Nothing to undo."}
+            db.set_handled(conn, row["pk"], False)
+            summary = db.queue_counts(conn)
+        subject = (row["subject"] or "").strip()
+        return {
+            "ok": True,
+            "pk": row["pk"],
+            "message": f"Restored “{subject[:60]}”." if subject else "Restored to the queue.",
+            "summary": summary,
+        }
+
     @app.get("/api/messages/{pk}/reader", response_class=HTMLResponse)
     def api_message_reader(request: Request, pk: int):
         """The right-hand pane for one message, rendered server-side.
@@ -467,7 +513,14 @@ def create_app() -> FastAPI:
         return TEMPLATES.TemplateResponse(
             request,
             "reader.html",
-            {"i": _decorate(row), "llm_ready": state["llm_ready"]},
+            {
+                "i": _decorate(row),
+                "llm_ready": state["llm_ready"],
+                # Rendered here rather than in the template: it is escaping
+                # work on hostile input, which belongs in tested code and not
+                # in a filter chain.
+                "body_html": bodyhtml.render_body(row["body_text"]),
+            },
         )
 
     @app.get("/api/messages/{pk}/body")

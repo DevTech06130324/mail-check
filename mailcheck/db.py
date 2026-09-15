@@ -594,6 +594,24 @@ def query_triaged(
     return list(conn.execute(sql, params))
 
 
+def last_handled(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The message marked Done most recently, if any.
+
+    Backs the console's Ctrl+Z once the page has no history of its own: a
+    finished check reloads the page, and undo should not quietly stop meaning
+    anything because the tab was rebuilt underneath the reader.
+    """
+    return conn.execute(
+        """
+        SELECT id AS pk, subject, handled_at
+        FROM messages
+        WHERE handled_at IS NOT NULL
+        ORDER BY handled_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
 def get_triaged(conn: sqlite3.Connection, pk: int) -> sqlite3.Row | None:
     """One message with its latest classification, body included.
 
