@@ -25,6 +25,7 @@ class DashboardFilters(BaseModel):
     start: date | None = None
     end: date | None = None
     days: int = Field(default=30, ge=1, le=90)
+    interval: Literal["day", "week"] = "day"
     tz: str = "UTC"
     account: str | None = Field(default=None, max_length=200)
     categories: list[str] = Field(default_factory=list, max_length=len(CATEGORIES))
