@@ -176,7 +176,9 @@ class AnalyticsTests(unittest.TestCase):
              TestClient(create_app()) as client:
             page = client.get("/dashboard")
             self.assertEqual(page.status_code, 200)
-            self.assertIn('href="/dashboard"', page.text)
+            # The compiled React app hydrates navigation in the browser; source
+            # installs without a frontend build keep rendering the legacy shell.
+            self.assertTrue('id="root"' in page.text or 'href="/dashboard"' in page.text)
             response = client.get("/api/dashboard?start=2026-09-14&end=2026-09-16&tz=UTC")
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["summary"]["total"], 1)

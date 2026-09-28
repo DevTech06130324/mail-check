@@ -11,10 +11,11 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ValidationError
@@ -45,6 +46,7 @@ ACTIONABLE_TIERS = (TIER_ACT, TIER_REPLY, TIER_UNKNOWN)
 ACTIONABLE_CATEGORIES = [c.name for c in CATEGORIES if c.tier in ACTIONABLE_TIERS]
 
 HERE = Path(__file__).parent
+FRONTEND_DIST = HERE / "frontend_dist"
 TEMPLATES = Jinja2Templates(directory=str(HERE / "templates"))
 
 
@@ -73,7 +75,7 @@ _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 _job_lock = threading.Lock()
 _job: dict = {"running": False, "message": "", "detail": "", "at": None,
-              "ok": True, "stage_started": None}
+              "ok": True, "stage_started": None, "completion_id": 0}
 
 #: In-flight Outlook device-code sign-in. Memory only — never written to disk.
 #: ``active_id`` names the one flow whose eventual result should be honoured;
@@ -154,6 +156,100 @@ class RuleBody(BaseModel):
     subject_contains: str | None = None
 
 
+class MessageSummary(BaseModel):
+    pk: int
+    message_id: str
+    subject: str
+    from_addr: str
+    from_name: str
+    date_utc: str | None = None
+    snippet: str = ""
+    provider_url: str | None = None
+    handled_at: str | None = None
+    account_label: str
+    provider: str = "imap"
+    category: str
+    confidence: float = 0
+    company: str | None = None
+    role: str | None = None
+    deadline: str | None = None
+    action_required: bool = False
+    summary: str = ""
+    source: str = "llm"
+    retryable: bool = False
+    tier: str
+    category_label: str
+    date_estimated: bool
+    date_display: str
+    deadline_display: str
+    open_url: str | None = None
+    open_label: str = ""
+
+
+class TriageGroup(BaseModel):
+    tier: str
+    label: str
+    items: list[MessageSummary]
+
+
+class TriageResponse(BaseModel):
+    view: str
+    groups: list[TriageGroup]
+    summary: dict[str, int]
+    counts: dict[str, int]
+    accounts: list[dict[str, Any]]
+    selected_account: str | None
+    selected_category: str | None
+    days: int
+    total: int
+
+
+class PublicAccount(BaseModel):
+    id: int
+    label: str
+    email: str
+    provider: str
+    imap_host: str
+    imap_port: int
+    use_ssl: bool
+    folder: str
+    enabled: bool
+
+
+class AccountsResponse(BaseModel):
+    accounts: list[PublicAccount]
+    outlook_ready: bool
+
+
+class ReaderResponse(BaseModel):
+    message: MessageSummary
+    body_html: str
+
+
+class BootstrapReadiness(BaseModel):
+    model: bool
+    accounts: bool
+    privacy_ack: bool
+    outlook: bool
+
+
+class BootstrapResponse(BaseModel):
+    readiness: BootstrapReadiness
+    counts: dict[str, int]
+    taxonomy: list[dict[str, str]]
+    presets: list[dict[str, Any]]
+    last_run: str
+    account_count: int
+
+
+class SettingsResponse(BaseModel):
+    settings: dict[str, Any]
+    rules: list[dict[str, Any]]
+    categories: list[dict[str, str]]
+    config_path: str
+    db_path: str
+
+
 # ------------------------------------------------------------------------- helpers
 
 
@@ -214,7 +310,7 @@ def _start_job(work, *, failed: str, on_finish=None) -> None:
             _job.update(message=failed, detail=str(exc), ok=False)
         finally:
             _job.update(running=False, at=datetime.now().strftime("%H:%M"),
-                        stage_started=None)
+                        stage_started=None, completion_id=_job["completion_id"] + 1)
             if on_finish is not None:
                 on_finish()
             _job_lock.release()
@@ -354,6 +450,14 @@ def _scheduler() -> None:
 def create_app() -> FastAPI:
     app = FastAPI(title="mail-check", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
+    if (FRONTEND_DIST / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+    def frontend_page():
+        index = FRONTEND_DIST / "index.html"
+        if index.is_file():
+            return FileResponse(index)
+        return None
 
     @app.exception_handler(ValidationError)
     async def invalid_saved_config(request: Request, exc: ValidationError):
@@ -386,6 +490,9 @@ def create_app() -> FastAPI:
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def analytics_dashboard(request: Request):
+        page = frontend_page()
+        if page:
+            return page
         with db.session() as conn:
             accounts = db.list_accounts(conn)
             state = _state(conn, accounts)
@@ -407,6 +514,113 @@ def create_app() -> FastAPI:
         with db.session() as conn:
             return dashboard_data(conn, filters, retention_days=cfg.check.retain_days)
 
+    @app.get("/api/bootstrap", response_model=BootstrapResponse)
+    def api_bootstrap():
+        """Small, non-sensitive shell data shared by every React page."""
+        with db.session() as conn:
+            accounts = db.list_accounts(conn)
+            state = _state(conn, accounts)
+            run = db.last_run(conn)
+            summary = db.queue_counts(conn)
+        return {
+            "readiness": {
+                "model": state["llm_ready"],
+                "accounts": state["has_accounts"],
+                "privacy_ack": state["cfg"].privacy_ack,
+                "outlook": bool(state["cfg"].outlook.client_id),
+            },
+            "counts": summary,
+            "taxonomy": [{"name": c.name, "label": c.label, "tier": c.tier}
+                         for c in CATEGORIES],
+            "presets": [{"key": p.key, "name": p.name, "host": p.host,
+                         "port": p.port, "use_ssl": p.use_ssl, "note": p.note,
+                         "supported": p.supported} for p in PRESETS],
+            "last_run": _fmt_run(run),
+            "account_count": state["account_count"],
+        }
+
+    @app.get("/api/triage", response_model=TriageResponse)
+    def api_triage(view: str = "queue", category: str | None = None,
+                   account: str | None = None, days: int = 30):
+        """Read the same bounded, body-free rows as the original console."""
+        if view not in ("queue", "all", "completed"):
+            return _err("Unknown mail view.")
+        if days not in (2, 3, 7, 14, 30, 90):
+            return _err("Choose a supported time range.")
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        handled = {"queue": False, "completed": True, "all": None}[view]
+        with db.session() as conn:
+            rows = db.query_triaged(
+                conn,
+                categories=([category] if category else
+                            ACTIONABLE_CATEGORIES if view == "queue" else None),
+                account_label=account,
+                since_iso=since,
+                handled=handled,
+                limit=500,
+            )
+            counts = db.category_counts(conn, since_iso=since, account_label=account,
+                                        handled=handled)
+            summary = db.queue_counts(conn, since_iso=since, account_label=account)
+            accounts = db.list_accounts(conn)
+        grouped: dict[str, list] = {tier: [] for tier in TIER_ORDER}
+        for row in rows:
+            item = _decorate(row)
+            grouped[item["tier"]].append(item)
+        return {
+            "view": view,
+            "groups": [{"tier": tier, "label": TIER_META[tier][0],
+                        "items": grouped[tier]} for tier in TIER_ORDER if grouped[tier]],
+            "summary": summary,
+            "counts": counts,
+            "accounts": [{"label": a.label, "enabled": a.enabled} for a in accounts],
+            "selected_account": account,
+            "selected_category": category,
+            "days": days,
+            "total": len(rows),
+        }
+
+    @app.get("/api/messages/{pk}", response_model=ReaderResponse)
+    def api_message(pk: int):
+        with db.session() as conn:
+            row = db.get_triaged(conn, pk)
+            if not row:
+                return _err("No such message.", 404)
+            body_html = bodyhtml.render_body(row["body_text"])
+        return {"message": _decorate(row), "body_html": str(body_html)}
+
+    @app.get("/api/accounts", response_model=AccountsResponse)
+    def api_accounts():
+        with db.session() as conn:
+            accounts = db.list_accounts(conn)
+        return {
+            "accounts": [{
+                "id": a.id, "label": a.label, "email": a.email,
+                "provider": a.provider, "imap_host": a.imap_host,
+                "imap_port": a.imap_port, "use_ssl": a.use_ssl,
+                "folder": a.folder, "enabled": a.enabled,
+            } for a in accounts],
+            "outlook_ready": bool(cfgmod.load().outlook.client_id),
+        }
+
+    @app.get("/api/settings", response_model=SettingsResponse)
+    def api_settings():
+        cfg = cfgmod.load()
+        return {
+            "settings": {
+                "llm": cfg.llm.model_dump(),
+                "check": cfg.check.model_dump(),
+                "watch": cfg.watch.model_dump(),
+                "outlook": cfg.outlook.model_dump(),
+                "privacy_ack": cfg.privacy_ack,
+            },
+            "rules": [rule.model_dump() for rule in cfg.prefilter_rules],
+            "categories": [{"name": c.name, "label": c.label}
+                           for c in CATEGORIES if c.name != UNCLASSIFIED],
+            "config_path": str(cfgmod.config_path()),
+            "db_path": str(cfgmod.db_path()),
+        }
+
     @app.get("/", response_class=HTMLResponse)
     def dashboard(
         request: Request,
@@ -421,6 +635,9 @@ def create_app() -> FastAPI:
         all       — everything, grouped by tier.
         completed — locally handled items, most recent first.
         """
+        page = frontend_page()
+        if page:
+            return page
         if view not in ("queue", "all", "completed"):
             view = "queue"
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -618,6 +835,9 @@ def create_app() -> FastAPI:
 
     @app.get("/accounts", response_class=HTMLResponse)
     def accounts_page(request: Request):
+        page = frontend_page()
+        if page:
+            return page
         with db.session() as conn:
             accounts = db.list_accounts(conn)
             state = _state(conn, accounts)
@@ -635,6 +855,9 @@ def create_app() -> FastAPI:
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
+        page = frontend_page()
+        if page:
+            return page
         state = _state()
         return TEMPLATES.TemplateResponse(
             request,
@@ -697,6 +920,7 @@ def create_app() -> FastAPI:
         due = _sched["next_due"]
         return {
             **_job,
+            "completion_id": _job["completion_id"],
             "auto": cfg.watch.auto_check,
             "interval_minutes": cfg.watch.interval_minutes,
             # Seconds remaining, so the browser never has to trust its own clock
@@ -972,6 +1196,18 @@ def create_app() -> FastAPI:
         cfg.prefilter_rules.pop(index)
         cfgmod.save(cfg)
         return {"ok": True, "message": "Rule removed."}
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def frontend_route(path: str):
+        # Let the SPA own deep links only after it has been built. The legacy
+        # template UI remains available in editable Python installs until then.
+        if FRONTEND_DIST.is_dir() and (FRONTEND_DIST / "index.html").is_file():
+            index = (FRONTEND_DIST / "index.html").resolve()
+            requested = (FRONTEND_DIST / path).resolve()
+            if requested.is_relative_to(FRONTEND_DIST.resolve()) and requested.is_file():
+                return FileResponse(requested)
+            return FileResponse(index)
+        return JSONResponse({"ok": False, "error": "Not found."}, status_code=404)
 
     return app
 

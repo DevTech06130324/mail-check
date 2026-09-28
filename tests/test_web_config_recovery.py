@@ -19,7 +19,7 @@ class WebConfigRecoveryTests(unittest.TestCase):
              patch.object(config, "config_path", return_value=Path("example-config.toml")), \
              patch("mailcheck.web.app._scheduler_started.is_set", return_value=True):
             with TestClient(create_app()) as client:
-                for path in ("/settings", "/api/status"):
+                for path in ("/api/settings", "/api/status"):
                     with self.subTest(path=path):
                         response = client.get(path)
                         self.assertEqual(response.status_code, 503)
@@ -28,6 +28,9 @@ class WebConfigRecoveryTests(unittest.TestCase):
                         self.assertNotIn("private-secret", response.text)
                         self.assertNotIn("old-router", response.text)
                         self.assertNotIn("old-model", response.text)
+                # A compiled SPA serves its shell at /settings and reads the
+                # safe recovery response from the JSON endpoint above.
+                self.assertIn(client.get("/settings").status_code, (200, 503))
 
 
 if __name__ == "__main__":

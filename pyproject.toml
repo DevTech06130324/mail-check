@@ -32,4 +32,4 @@ build-backend = "setuptools.build_meta"
 include = ["mailcheck*"]
 
 [tool.setuptools.package-data]
-"mailcheck.web" = ["templates/*.html", "static/*"]
+"mailcheck.web" = ["templates/*.html", "static/*", "frontend_dist/*", "frontend_dist/assets/*"]

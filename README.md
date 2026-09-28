@@ -301,6 +301,21 @@ python -m unittest discover -s tests
 python -m tests.benchmark_analytics
 ```
 
+The React console lives in `frontend/` and is built with Vite, TypeScript,
+Tailwind CSS, and shadcn/ui. Use Node.js 20 or newer while developing:
+
+```bash
+npm --prefix frontend install
+npm --prefix frontend run test
+npm --prefix frontend run build
+```
+
+The build writes the bundled, self-contained UI to `mailcheck/web/frontend_dist/`;
+it is included in Python package builds so installed users need only Python. For
+hot reload, run `mail-check web --no-open` in one terminal and
+`npm --prefix frontend run dev` in another, then open <http://127.0.0.1:5173>. The Vite server
+forwards API requests to the local FastAPI console.
+
 Runs the whole pipeline against a fake mailbox and a fake model — including the malformed-JSON
 paths — with no network and no credentials. See [docs/DESIGN.md](docs/DESIGN.md) for the
 architecture and the reasoning behind each decision.
