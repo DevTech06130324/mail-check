@@ -43,6 +43,9 @@
 {% if i.summary %}<p class="reader-summary">{{ i.summary }}</p>{% endif %}
 
 <div class="reader-meta">
+  {% if i.date_estimated %}
+  <div class="kv"><span>Date</span><span>Estimated from collection time</span></div>
+  {% endif %}
   {% if i.company %}<div class="kv"><span>Company</span><span>{{ i.company }}</span></div>{% endif %}
   {% if i.role %}<div class="kv"><span>Role</span><span>{{ i.role }}</span></div>{% endif %}
   <div class="kv"><span>Account</span><span>{{ i.account_label }}</span></div>

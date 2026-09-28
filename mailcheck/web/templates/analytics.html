@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · mail-check{% endblock %}
+{% block content %}
+<link rel="stylesheet" href="/static/analytics.css?v={{ asset_v() }}">
+<div id="analytics" data-dashboard>
+  <header class="analytics-head">
+    <div><h1>Dashboard</h1><p>Explore your email activity and the messages behind it.</p></div>
+    <button type="button" class="btn sm" id="dashboard-refresh">Refresh</button>
+  </header>
+  <p id="status-line" class="analytics-note" role="status" aria-live="polite">{{ status.message if status is defined and status else '' }}</p>
+  <form id="dashboard-filters" class="analytics-controls" aria-label="Dashboard filters">
+    <label>Range<select id="dashboard-range" name="days"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option><option value="custom">Custom range</option></select></label>
+    <div id="dashboard-custom" class="analytics-dates" hidden>
+      <label>Start<input type="date" id="dashboard-start" name="start"></label>
+      <label>End<input type="date" id="dashboard-end" name="end"></label>
+      <button type="button" id="dashboard-apply-dates" class="btn sm">Apply dates</button>
+    </div>
+    <label>Account<select id="dashboard-account" name="account"><option value="">All accounts</option>{% for account in accounts %}<option value="{{ account.label }}">{{ account.label }}</option>{% endfor %}</select></label>
+    <label class="analytics-search">Search<input type="search" id="dashboard-search" name="q" maxlength="200" placeholder="Subject, sender, company, role, summary" aria-describedby="dashboard-search-help"></label>
+    <button type="button" class="btn sm" id="dashboard-reset">Reset filters</button>
+    <details class="analytics-category-filter"><summary>Advanced filters <span>Categories: <span id="dashboard-category-count">All</span></span><span id="dashboard-advanced-state"></span></summary>
+      <div class="analytics-advanced-controls">
+        <label>Status<select id="dashboard-status" name="status"><option value="all">All</option><option value="pending">Pending</option><option value="done">Done</option></select></label>
+        <label>Action required<select id="dashboard-action" name="action"><option value="all">All</option><option value="yes">Yes</option><option value="no">No</option></select></label>
+      </div>
+      <fieldset><legend class="sr-only">Include categories</legend>{% for category in categories %}<label><input type="checkbox" name="category" value="{{ category.name }}">{{ category.label }}</label>{% endfor %}</fieldset>
+      <button type="button" class="btn sm" id="dashboard-all-categories">All categories</button>
+    </details>
+    <p id="dashboard-search-help" class="analytics-note">Search covers message details and summaries. Dates use <strong id="dashboard-timezone">your browser timezone</strong>.</p>
+  </form>
+  <div id="dashboard-error" class="analytics-error" role="alert" hidden><span></span> <button type="button" class="btn sm" id="dashboard-retry">Try again</button></div>
+  <p id="dashboard-loading" class="analytics-note" role="status" aria-live="polite">Loading dashboard…</p>
+  <section class="analytics-stats" aria-label="Message totals" id="dashboard-stats">
+    <div class="analytics-stat"><span>Total messages</span><strong id="dashboard-total">—</strong></div>
+    <div class="analytics-stat"><span>Pending attention</span><strong id="dashboard-pending">—</strong></div>
+    <div class="analytics-stat"><span>Completed</span><strong id="dashboard-completed">—</strong></div>
+    <div class="analytics-stat"><span>Unclassified</span><strong id="dashboard-unclassified">—</strong><small id="dashboard-retryable">— retryable</small></div>
+  </section>
+  <p id="dashboard-history" class="analytics-note"></p>
+  <p class="analytics-note">Deleted mail and emails that were already read before collection or never collected are unavailable.</p>
+  <section class="analytics-charts" aria-label="Email activity">
+    <div class="analytics-panel analytics-daily"><h2>Daily activity</h2><p class="analytics-note">Locally collected emails by received date.</p><p class="analytics-note">Select a bar to explore that day and category. Totals follow the filters above.</p><div class="analytics-chart"><canvas id="dashboard-chart" role="img" aria-label="Daily message counts by category. The activity table below provides all values and drilldown controls."></canvas></div><p id="dashboard-chart-fallback" class="analytics-note" hidden>The chart is unavailable. Use the activity table below to explore the same data.</p>
+      <details id="dashboard-table-details"><summary>View activity table</summary><div class="analytics-table-scroll"><table id="dashboard-daily-table"><caption class="sr-only">Daily message counts. Select a count to filter the message explorer.</caption><thead></thead><tbody></tbody></table></div></details>
+    </div>
+    <div class="analytics-panel"><h2>By category</h2><p class="analytics-note">Colors match daily activity. Select a category to filter the dashboard.</p><div id="dashboard-category-bars"></div></div>
+  </section>
+  <section class="analytics-panel analytics-explorer" aria-labelledby="dashboard-explorer-title">
+    <header class="analytics-explorer-head"><div><h2 id="dashboard-explorer-title">Message explorer</h2><p id="dashboard-message-count" class="analytics-note" role="status" aria-live="polite">Loading messages…</p></div><label>Order<select id="dashboard-sort"><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label></header>
+    <div id="dashboard-focus" hidden><span></span><button type="button" class="btn sm" id="dashboard-clear-focus" aria-label="Clear chart selection">Clear selection ×</button></div>
+    <div class="analytics-explorer-grid">
+      <div id="dashboard-list-panel"><p class="analytics-note">↑ / ↓ moves between messages; Enter opens a message.</p><div id="dashboard-messages" class="analytics-messages" tabindex="0" aria-label="Messages"></div><div class="analytics-pagination"><button type="button" class="btn sm" id="dashboard-prev">Previous</button><span id="dashboard-page">—</span><button type="button" class="btn sm" id="dashboard-next">Next</button></div></div>
+      <section id="dashboard-reader-panel" class="analytics-reader-panel" aria-label="Message reader"><button type="button" class="btn sm analytics-reader-back" id="dashboard-reader-back">← Back to messages</button><div id="reader" class="reader"><p class="reader-placeholder">Select a message to read it.</p></div></section>
+    </div>
+  </section>
+</div>
+<noscript><p class="note">Enable JavaScript to load the dashboard. <a href="/">Open Triage</a> to review messages.</p></noscript>
+{% endblock %}
+{% block scripts %}
+<script src="/static/chart.umd.min.js?v={{ asset_v() }}"></script>
+<script src="/static/analytics.js?v={{ asset_v() }}"></script>
+{% endblock %}

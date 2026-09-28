@@ -120,7 +120,7 @@ class FakeLLM:
         self.mode = mode
         self.calls = 0
 
-    def complete(self, system, user, json_mode=True, max_tokens=2048):
+    def complete(self, system, user, json_mode=True, max_tokens=2048, deadline=None):
         self.calls += 1
         payload = json.loads(user.split("Classify these emails:\n", 1)[1])
         results = []
@@ -336,7 +336,7 @@ def test_classify_modes(msgs):
         def __init__(self):
             self.budgets = []
 
-        def complete(self, system, user, json_mode=None, max_tokens=2048):
+        def complete(self, system, user, json_mode=None, max_tokens=2048, deadline=None):
             self.budgets.append(max_tokens)
             return Completion('{"results": [{"id": "1", "cate', "length")
 
@@ -396,24 +396,13 @@ def test_pipeline_and_cache(msgs):
         conn.close()
 
 
-def test_sse_and_reasoning():
-    """Many OpenAI-compatible proxies stream even when asked not to, and
-    reasoning models leak a scratchpad into `content`. Both were found against
-    a real endpoint."""
+def test_ollama_and_reasoning():
+    """Native Ollama content is separate from its reasoning scratchpad."""
     import http.server
     import socketserver
     import threading
 
-    print("\nstreaming (SSE) endpoints")
-
-    chunks = [
-        {"choices": [{"index": 0, "delta": {"role": "assistant"}}]},
-        # Reasoning deltas carry brace noise that must not reach the parser.
-        {"choices": [{"index": 0, "delta": {"reasoning_content": 'draft {"id":"9"}'}}]},
-        {"choices": [{"index": 0, "delta": {"content": '{"results": [{"id": "0", "cat'}}]},
-        {"choices": [{"index": 0, "delta": {"content": 'egory": "rejection"}]}'}}]},
-        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
-    ]
+    print("\nnative Ollama responses")
     seen = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -422,13 +411,23 @@ def test_sse_and_reasoning():
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            seen["stream"] = body.get("stream")
+            seen.update(body)
+            seen["path"] = self.path
+            seen["authorization"] = self.headers.get("Authorization")
+            reply = json.dumps({
+                "message": {
+                    "role": "assistant",
+                    "thinking": 'draft {"id":"9"}',
+                    "content": '{"results": [{"id": "0", "category": "rejection"}]}',
+                },
+                "done": True,
+                "done_reason": "stop",
+            }).encode()
             self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
             self.end_headers()
-            for c in chunks:
-                self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.write(reply)
 
     srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -436,16 +435,19 @@ def test_sse_and_reasoning():
         from mailcheck.llm.client import LLMClient
 
         with LLMClient(
-            base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1", token="t", model="m"
+            base_url=f"http://127.0.0.1:{srv.server_address[1]}", model="m"
         ) as client:
             out = client.complete("sys", "user")
+        check("uses native chat endpoint", seen["path"] == "/api/chat")
+        check("sends no authorization", seen["authorization"] is None)
         check("asks for stream=false", seen.get("stream") is False)
-        check("reassembles split SSE deltas", '"category": "rejection"' in out, out)
-        check("excludes reasoning_content", '"id":"9"' not in out, out)
+        check("extracts message content", '"category": "rejection"' in out, out)
+        check("excludes thinking", '"id":"9"' not in out, out)
         check("result parses", parse_results(out)["0"].category == "rejection")
         check("carries why the model stopped", out.finish_reason == "stop", repr(out))
     finally:
         srv.shutdown()
+        srv.server_close()
 
     print("\nreasoning scratchpad stripping")
     think = '<think>maybe {"results":[{"id":"9","category":"offer"}]}</think>' \
@@ -499,14 +501,12 @@ def test_web_console(msgs):
     import tempfile as tf
 
     from mailcheck import config as cfgmod
-    from mailcheck import secrets as secmod
 
     print("\nweb console")
     tmp = Path(tf.mkdtemp())
-    orig_db, orig_cfg, orig_token = cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token
+    orig_db, orig_cfg = cfgmod.db_path, cfgmod.config_path
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: False  # deterministic, ignore the real keyring
     try:
         conn = db.connect(tmp / "t.db")
         db.add_account(conn, label="gmail", email="me@example.com", imap_host="imap.gmail.com")
@@ -555,8 +555,11 @@ def test_web_console(msgs):
                                                  "host": "h", "password": "passéword"})
         check("non-ASCII password refused at the API", "U+00E9" in bad.json()["error"])
 
+        check("check refused before setup",
+              client.post("/api/check", json={}).status_code == 400)
+
         check("save settings", client.post(
-            "/api/settings", json={"base_url": "http://x/v1", "model": "m", "batch_size": 4}
+            "/api/settings", json={"base_url": "http://x", "model": "m", "batch_size": 4}
         ).json()["ok"])
         check("  settings persisted", cfgmod.load().llm.batch_size == 4)
         check("out-of-range batch_size refused",
@@ -587,11 +590,8 @@ def test_web_console(msgs):
             headers={"Origin": "http://127.0.0.1:8765"}).status_code == 200)
         check("GET unaffected by Origin", client.get(
             "/", headers={"Origin": "https://evil.example"}).status_code == 200)
-        check("check refused before setup",
-              client.post("/api/check", json={}).status_code == 400)
     finally:
         cfgmod.db_path, cfgmod.config_path = orig_db, orig_cfg
-        secmod.has_llm_token = orig_token
 
 
 def test_schedule():
@@ -601,20 +601,18 @@ def test_schedule():
     import time as clock
 
     from mailcheck import config as cfgmod
-    from mailcheck import secrets as secmod
 
     print("\nautomatic checks + countdown")
     tmp = Path(tf.mkdtemp())
-    orig_db, orig_cfg, orig_token = cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token
+    orig_db, orig_cfg = cfgmod.db_path, cfgmod.config_path
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     try:
         conn = db.connect(tmp / "t.db")
         db.add_account(conn, label="gmail", email="me@x.com", imap_host="h")
         conn.close()
         cfgmod.save(cfgmod.Config.model_validate({
-            "llm": {"base_url": "http://x/v1", "model": "m"},
+            "llm": {"base_url": "http://x", "model": "m"},
             "watch": {"interval_minutes": 10, "auto_check": False},
         }))
 
@@ -669,7 +667,6 @@ def test_schedule():
         cfgmod.save(cfg)
     finally:
         cfgmod.db_path, cfgmod.config_path = orig_db, orig_cfg
-        secmod.has_llm_token = orig_token
 
 
 def test_migration():
@@ -739,11 +736,10 @@ def test_action_queue(msgs):
 
     print("\naction queue + Done/Undo")
     tmp = Path(tf.mkdtemp())
-    orig = (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+    orig = (cfgmod.db_path, cfgmod.config_path,
             secmod.get_account_password)
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     secmod.get_account_password = lambda label: "dummy"
     try:
         actionable = [c.name for c in CATS if c.tier in ("act", "reply")]
@@ -993,7 +989,7 @@ def test_action_queue(msgs):
         with db.session(tmp / "t.db") as c3:
             db.set_handled(c3, pks[3], False)
     finally:
-        (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+        (cfgmod.db_path, cfgmod.config_path,
          secmod.get_account_password) = orig
 
 
@@ -1010,11 +1006,10 @@ def test_review_fixes(msgs):
 
     print("\nprovider link detection (no more mislabeled Gmail links)")
     tmp = Path(tf.mkdtemp())
-    orig = (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+    orig = (cfgmod.db_path, cfgmod.config_path,
             secmod.get_account_password)
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     secmod.get_account_password = lambda label: "dummy"
     try:
         from mailcheck.web.app import _open_link
@@ -1057,14 +1052,13 @@ def test_review_fixes(msgs):
         check("Outlook account uses its own webLink", url == "https://outlook.live.com/x")
         check("  labelled 'Open in Outlook'", label_ == "Open in Outlook")
     finally:
-        (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+        (cfgmod.db_path, cfgmod.config_path,
          secmod.get_account_password) = orig
 
     print("\nunclassified mail surfaces in the queue, never only in All mail")
     tmp = Path(tf.mkdtemp())
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     secmod.get_account_password = lambda label: "dummy"
     try:
         from fastapi.testclient import TestClient
@@ -1090,14 +1084,13 @@ def test_review_fixes(msgs):
         check("unclassified mail appears in the default queue view",
               "Needs a manual look" in queue_html)
     finally:
-        (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+        (cfgmod.db_path, cfgmod.config_path,
          secmod.get_account_password) = orig
 
     print("\nOutlook account Test uses the real provider, not a hardcoded IMAPSource")
     tmp = Path(tf.mkdtemp())
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     try:
         from fastapi.testclient import TestClient
 
@@ -1111,7 +1104,12 @@ def test_review_fixes(msgs):
         cfgmod.save(cfg)
 
         client = TestClient(create_app())
-        r = client.post("/api/accounts/ol/test")
+        # MSAL performs network discovery at construction even with no cached
+        # accounts. Keep provider/auth routing real while making that boundary
+        # deterministic and offline.
+        from unittest.mock import Mock, patch
+        with patch.object(oa, "_app", return_value=Mock(get_accounts=lambda: [])):
+            r = client.post("/api/accounts/ol/test")
         # No cache exists for this label, so the real Graph path must fail with
         # a sign-in-reconnect message — never an IMAP host/password error, which
         # is what the old hardcoded-IMAPSource bug produced instead.
@@ -1119,15 +1117,14 @@ def test_review_fixes(msgs):
               r.status_code == 400 and "econnect" in r.json()["error"], r.text)
         check("  never a bogus IMAP error", "imap" not in r.json()["error"].lower())
     finally:
-        cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token = (
-            orig[0], orig[1], orig[2]
+        cfgmod.db_path, cfgmod.config_path = (
+            orig[0], orig[1]
         )
 
     print("\nOutlook cancel actually stops the pending sign-in")
     tmp = Path(tf.mkdtemp())
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     try:
         from fastapi.testclient import TestClient
 
@@ -1193,8 +1190,8 @@ def test_review_fixes(msgs):
             oa.begin_device_flow, oa.complete_device_flow = real_begin, real_complete
             oa.delete_cache("ol2")
     finally:
-        cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token = (
-            orig[0], orig[1], orig[2]
+        cfgmod.db_path, cfgmod.config_path = (
+            orig[0], orig[1]
         )
 
     print("\nconfig: atomic save, max_retries floor, use_json_mode wiring")
@@ -1210,7 +1207,7 @@ def test_review_fixes(msgs):
 
         from mailcheck.llm.client import LLMClient
 
-        clamped = LLMClient(base_url="http://x/v1", token="t", model="m", max_retries=0)
+        clamped = LLMClient(base_url="http://x", model="m", max_retries=0)
         check("LLMClient defensively clamps max_retries=0 to 1", clamped.max_retries == 1)
         clamped.close()
 
@@ -1237,7 +1234,7 @@ def test_review_fixes(msgs):
                 length = int(self.headers["Content-Length"])
                 bodies.append(jsonlib.loads(self.rfile.read(length)))
                 reply = jsonlib.dumps(
-                    {"choices": [{"message": {"content": "{}"}}]}
+                    {"message": {"content": "{}"}, "done": True, "done_reason": "stop"}
                 ).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1248,25 +1245,25 @@ def test_review_fixes(msgs):
         srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
         th.Thread(target=srv.serve_forever, daemon=True).start()
         try:
-            base = f"http://127.0.0.1:{srv.server_address[1]}/v1"
-            with LLMClient(base_url=base, token="t", model="m", use_json_mode=False) as c:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            with LLMClient(base_url=base, model="m", use_json_mode=False) as c:
                 c.complete("sys", "user")
-            with LLMClient(base_url=base, token="t", model="m", use_json_mode=True) as c:
+            with LLMClient(base_url=base, model="m", use_json_mode=True) as c:
                 c.complete("sys", "user")
         finally:
             srv.shutdown()
 
-        check("use_json_mode=False omits response_format",
-              "response_format" not in bodies[0], str(bodies[0]))
-        check("use_json_mode=True (default) sends response_format",
-              "response_format" in bodies[1], str(bodies[1]))
+        check("use_json_mode=False omits format",
+              "format" not in bodies[0], str(bodies[0]))
+        check("use_json_mode=True (default) sends format",
+              bodies[1].get("format") == "json", str(bodies[1]))
 
         # classify.py's batch call must defer to the client's setting rather
         # than hardcoding True and silently overriding it.
         seen_json_mode = {}
 
         class RecordingClient:
-            def complete(self, system, user, json_mode=None, max_tokens=2048):
+            def complete(self, system, user, json_mode=None, max_tokens=2048, deadline=None):
                 seen_json_mode["value"] = json_mode
                 return json.dumps({"results": [{"id": "0", "category": "rejection"}]})
 
@@ -1280,7 +1277,6 @@ def test_review_fixes(msgs):
     tmp = Path(tf.mkdtemp())
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     try:
         from fastapi.testclient import TestClient
 
@@ -1299,15 +1295,14 @@ def test_review_fixes(msgs):
         client.post("/api/settings", json={"privacy_ack": True})
         check("the explicit toggle does acknowledge it", cfgmod.load().privacy_ack is True)
     finally:
-        cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token = (
-            orig[0], orig[1], orig[2]
+        cfgmod.db_path, cfgmod.config_path = (
+            orig[0], orig[1]
         )
 
     print("\naccount labels never reach an inline JS string (XSS)")
     tmp = Path(tf.mkdtemp())
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     try:
         from fastapi.testclient import TestClient
 
@@ -1331,7 +1326,7 @@ def test_review_fixes(msgs):
         check("<script>1</script> is not present unescaped (would prove injection)",
               "<script>1</script>" not in html)
     finally:
-        (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+        (cfgmod.db_path, cfgmod.config_path,
          secmod.get_account_password) = orig
 
 
@@ -1470,20 +1465,16 @@ def test_reclassify(msgs):
     import tempfile as tf
 
     from mailcheck import config as cfgmod
-    from mailcheck import secrets as secmod
     from mailcheck import pipeline as pipe
 
     print("\nre-classify unclassified mail")
     tmp = Path(tf.mkdtemp())
-    orig = (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
-            secmod.get_llm_token)
+    orig = (cfgmod.db_path, cfgmod.config_path)
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
-    secmod.get_llm_token = lambda: "fake-token"
     try:
         cfgmod.save(cfgmod.Config.model_validate(
-            {"llm": {"base_url": "http://x/v1", "model": "m"}}
+            {"llm": {"base_url": "http://x", "model": "m"}}
         ))
         conn = db.connect(tmp / "t.db")
         db.add_account(conn, label="gmail", email="me@x.com", imap_host="imap.gmail.com")
@@ -1513,7 +1504,9 @@ def test_reclassify(msgs):
         cfg = cfgmod.load()
         cfg.llm.model = "m"
         real_client = pipe.LLMClient
-        pipe.LLMClient = lambda **kw: _FakeLLMContext(FakeLLM("clean"))
+        pipe.LLMClient = type("FakeClientFactory", (), {
+            "from_config": staticmethod(lambda cfg: _FakeLLMContext(FakeLLM("clean")))
+        })
         try:
             result = pipe.reclassify(conn, cfg)
         finally:
@@ -1560,8 +1553,7 @@ def test_reclassify(msgs):
         finally:
             W._job_lock.release()
     finally:
-        (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
-         secmod.get_llm_token) = orig
+        (cfgmod.db_path, cfgmod.config_path) = orig
 
 
 class _FakeLLMContext:
@@ -1582,14 +1574,12 @@ def test_lazy_bodies_and_inplace_done(msgs):
     import tempfile as tf
 
     from mailcheck import config as cfgmod
-    from mailcheck import secrets as secmod
 
     print("\ndashboard payload + in-place Done")
     tmp = Path(tf.mkdtemp())
-    orig = (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token)
+    orig = (cfgmod.db_path, cfgmod.config_path)
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     try:
         conn = db.connect(tmp / "t.db")
         db.add_account(conn, label="gmail", email="me@x.com", imap_host="imap.gmail.com")
@@ -1631,7 +1621,7 @@ def test_lazy_bodies_and_inplace_done(msgs):
               r.json()["summary"]["done"] == 1 and r.json()["summary"]["actionable"] == 0,
               str(r.json()["summary"]))
     finally:
-        cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token = orig
+        cfgmod.db_path, cfgmod.config_path = orig
 
 
 def test_body_rendering():
@@ -1820,17 +1810,15 @@ def test_undo(msgs):
     from pathlib import Path
 
     import mailcheck.config as cfgmod
-    import mailcheck.secrets as secmod
     from fastapi.testclient import TestClient
 
     from mailcheck.web.app import create_app
 
     print("\nundo the last Done")
     tmp = Path(tf.mkdtemp())
-    orig = (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token)
+    orig = (cfgmod.db_path, cfgmod.config_path)
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     try:
         with db.session() as conn:
             db.add_account(conn, label="gmail", email="a@gmail.com",
@@ -1890,7 +1878,7 @@ def test_undo(msgs):
         check("  and never stealing undo from a field",
               "input, select, textarea" in page)
     finally:
-        cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token = orig
+        cfgmod.db_path, cfgmod.config_path = orig
 
 
 def test_retention():
@@ -1905,15 +1893,13 @@ def test_retention():
 
     from mailcheck import config as cfgmod
     from mailcheck import pipeline as pipe
-    from mailcheck import secrets as secmod
 
     print("\nretention window")
     tmp = Path(tf.mkdtemp())
-    orig = (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+    orig = (cfgmod.db_path, cfgmod.config_path,
             pipe.fetch_account)
     cfgmod.db_path = lambda: tmp / "t.db"
     cfgmod.config_path = lambda: tmp / "config.toml"
-    secmod.has_llm_token = lambda: True
     # Retention must not depend on a mailbox being reachable, or on this run
     # happening to find anything — so every check below fetches nothing at all.
     pipe.fetch_account = lambda *a, **kw: []
@@ -1941,7 +1927,7 @@ def test_retention():
         conn.commit()
 
         cfg = cfgmod.Config.model_validate(
-            {"llm": {"base_url": "http://x/v1", "model": "m"},
+            {"llm": {"base_url": "http://x", "model": "m"},
              "check": {"lookback_days": 2, "retain_days": 7}})
         cfgmod.save(cfg)
         result = pipe.check_once(conn, cfg)
@@ -1972,7 +1958,7 @@ def test_retention():
         db.set_handled(conn, keeper, True)
         conn.commit()
         wide = cfgmod.Config.model_validate(
-            {"llm": {"base_url": "http://x/v1", "model": "m"},
+            {"llm": {"base_url": "http://x", "model": "m"},
              "check": {"lookback_days": 30, "retain_days": 1}})
         result = pipe.check_once(conn, wide)
         still = {r["message_id"] for r in db.query_triaged(conn, handled=True)}
@@ -1989,7 +1975,7 @@ def test_retention():
         check("the default keeps a week", cfgmod.Config().check.retain_days == 7,
               str(cfgmod.Config().check.retain_days))
     finally:
-        (cfgmod.db_path, cfgmod.config_path, secmod.has_llm_token,
+        (cfgmod.db_path, cfgmod.config_path,
          pipe.fetch_account) = orig
 
 
@@ -2001,7 +1987,7 @@ def main() -> int:
     msgs = test_normalize()
     test_prefilter(msgs)
     test_parsing()
-    test_sse_and_reasoning()
+    test_ollama_and_reasoning()
     test_classify_modes(msgs)
     test_pipeline_and_cache(msgs)
     test_web_console(msgs)

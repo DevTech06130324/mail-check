@@ -12,7 +12,7 @@ from typing import Iterator
 from . import config
 from .models import Classification, NormalizedMessage
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 #: ``INSERT ... RETURNING`` needs SQLite 3.35 (2021). Python 3.11 bundles far
 #: newer than that everywhere we run, but the two-statement fallback costs
@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS classifications (
     model           TEXT NOT NULL,
     prompt_version  TEXT NOT NULL,
     source          TEXT NOT NULL DEFAULT 'llm',
+    retryable       INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL,
     UNIQUE(message_pk, model, prompt_version)
 );
@@ -79,6 +80,12 @@ CREATE TABLE IF NOT EXISTS runs (
     fetched          INTEGER DEFAULT 0,
     classified       INTEGER DEFAULT 0,
     from_cache       INTEGER DEFAULT 0,
+    fetch_seconds    REAL DEFAULT 0,
+    classification_seconds REAL DEFAULT 0,
+    llm_requests     INTEGER DEFAULT 0,
+    llm_timeouts     INTEGER DEFAULT 0,
+    llm_busy_responses INTEGER DEFAULT 0,
+    llm_retries      INTEGER DEFAULT 0,
     errors           TEXT
 );
 """
@@ -105,6 +112,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_handled ON messages(handled_at);
 CREATE INDEX IF NOT EXISTS idx_messages_acct_date ON messages(account_id, date_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_handled_date ON messages(handled_at, date_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_received
+    ON messages(julianday(COALESCE(date_utc, fetched_at)), id);
 CREATE INDEX IF NOT EXISTS idx_class_latest
     ON classifications(message_pk, created_at DESC, id DESC);
 """
@@ -116,6 +125,13 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("messages", "provider_url", "TEXT"),
     ("messages", "handled_at", "TEXT"),
     ("messages", "web_notified", "INTEGER NOT NULL DEFAULT 0"),
+    ("classifications", "retryable", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "fetch_seconds", "REAL DEFAULT 0"),
+    ("runs", "classification_seconds", "REAL DEFAULT 0"),
+    ("runs", "llm_requests", "INTEGER DEFAULT 0"),
+    ("runs", "llm_timeouts", "INTEGER DEFAULT 0"),
+    ("runs", "llm_busy_responses", "INTEGER DEFAULT 0"),
+    ("runs", "llm_retries", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -386,6 +402,8 @@ def get_cached(
     ).fetchone()
     if not row:
         return None
+    if row["retryable"]:
+        return None
     return Classification(
         category=row["category"],
         confidence=row["confidence"] or 0.0,
@@ -395,6 +413,7 @@ def get_cached(
         action_required=bool(row["action_required"]),
         summary=row["summary"] or "",
         source=row["source"],
+        retryable=bool(row["retryable"]),
     )
 
 
@@ -418,8 +437,8 @@ def save_classification(
         """
         INSERT INTO classifications
             (message_pk, category, confidence, company, role, deadline,
-             action_required, summary, model, prompt_version, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             action_required, summary, model, prompt_version, source, retryable, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(message_pk, model, prompt_version) DO UPDATE SET
             category = excluded.category,
             confidence = excluded.confidence,
@@ -429,6 +448,7 @@ def save_classification(
             action_required = excluded.action_required,
             summary = excluded.summary,
             source = excluded.source,
+            retryable = excluded.retryable,
             created_at = excluded.created_at
         """,
         (
@@ -443,6 +463,7 @@ def save_classification(
             model,
             prompt_version,
             result.source,
+            int(result.retryable),
             _now(),
         ),
     )
@@ -468,10 +489,18 @@ def finish_run(
     classified: int,
     from_cache: int,
     errors: list[str],
+    fetch_seconds: float = 0.0,
+    classification_seconds: float = 0.0,
+    llm_requests: int = 0,
+    llm_timeouts: int = 0,
+    llm_busy_responses: int = 0,
+    llm_retries: int = 0,
 ) -> None:
     conn.execute(
         "UPDATE runs SET finished_at = ?, accounts_checked = ?, fetched = ?,"
-        " classified = ?, from_cache = ?, errors = ? WHERE id = ?",
+        " classified = ?, from_cache = ?, errors = ?, fetch_seconds = ?,"
+        " classification_seconds = ?, llm_requests = ?, llm_timeouts = ?,"
+        " llm_busy_responses = ?, llm_retries = ? WHERE id = ?",
         (
             _now(),
             accounts_checked,
@@ -479,6 +508,12 @@ def finish_run(
             classified,
             from_cache,
             "\n".join(errors) or None,
+            fetch_seconds,
+            classification_seconds,
+            llm_requests,
+            llm_timeouts,
+            llm_busy_responses,
+            llm_retries,
             run_id,
         ),
     )
@@ -566,7 +601,7 @@ def query_triaged(
                m.date_utc, m.snippet, m.provider_url, m.handled_at,
                a.label AS account_label, a.provider, a.imap_host,
                c.category, c.confidence, c.company, c.role, c.deadline,
-               c.action_required, c.summary, c.source, c.created_at
+               c.action_required, c.summary, c.source, c.retryable, c.created_at
         FROM messages m
         JOIN accounts a ON a.id = m.account_id
         """
@@ -623,10 +658,10 @@ def get_triaged(conn: sqlite3.Connection, pk: int) -> sqlite3.Row | None:
     return conn.execute(
         """
         SELECT m.id AS pk, m.message_id, m.subject, m.from_addr, m.from_name,
-               m.date_utc, m.snippet, m.body_text, m.provider_url, m.handled_at,
+               m.date_utc, m.fetched_at, m.snippet, m.body_text, m.provider_url, m.handled_at,
                a.label AS account_label, a.provider, a.imap_host,
                c.category, c.confidence, c.company, c.role, c.deadline,
-               c.action_required, c.summary, c.source, c.created_at
+               c.action_required, c.summary, c.source, c.retryable, c.created_at
         FROM messages m
         JOIN accounts a ON a.id = m.account_id
         """

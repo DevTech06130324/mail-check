@@ -4,30 +4,52 @@
 
 <div class="page-head">
   <h1>Settings</h1>
-  <p>Stored locally. Your auth token lives in the OS keyring, never in a file.</p>
+  <p>Settings stay on this computer. Mailbox credentials live in the OS keyring.</p>
 </div>
 
 <div class="card">
   <div class="card-head">
-    <h2>Model</h2>
-    <p>Any OpenAI-compatible endpoint — OmniRoute, OpenRouter, or a local proxy.</p>
+    <h2>Ollama model</h2>
+    <p>Connect to your local or LAN Ollama server.</p>
   </div>
   <div class="card-body">
     <div class="field">
-      <label for="s-base">Base URL</label>
+      <label for="s-base">Ollama server URL</label>
       <input type="text" id="s-base" value="{{ cfg.llm.base_url }}"
-             placeholder="http://localhost:20128/v1">
-      <div class="hint">Usually ends in <code>/v1</code>. mail-check appends
-        <code>/chat/completions</code>.</div>
+             placeholder="http://192.168.2.230:11440">
+      <div class="hint">Enter the server root, with no <code>/v1</code> or API path.</div>
     </div>
     <div class="field">
       <label for="s-model">Model</label>
-      <input type="text" id="s-model" value="{{ cfg.llm.model }}" placeholder="model-name">
+      <input type="text" id="s-model" value="{{ cfg.llm.model }}" placeholder="qwen3.5:35b-a3b">
     </div>
     <div class="field">
-      <label for="s-token">Auth token</label>
-      <input type="password" id="s-token"
-             placeholder="{{ '••••••••  (stored — leave blank to keep)' if has_token else 'Paste your token' }}">
+      <label for="s-think">
+        <input type="checkbox" id="s-think" {% if cfg.llm.think %}checked{% endif %}>
+        Enable thinking
+      </label>
+      <div class="hint">For models that support thinking. May increase response time.</div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="s-context">Context size (tokens)</label>
+        <input type="number" id="s-context" value="{{ cfg.llm.num_ctx }}" min="1024" max="262144">
+        <div class="hint">Larger contexts need more server memory.</div>
+      </div>
+      <div class="field">
+        <label for="s-timeout">Request timeout (seconds)</label>
+        <input type="number" id="s-timeout" value="{{ cfg.llm.timeout_seconds }}" min="5" max="60">
+      </div>
+      <div class="field">
+        <label for="s-deadline">Classification deadline (seconds)</label>
+        <input type="number" id="s-deadline" value="{{ cfg.llm.classification_deadline_seconds }}" min="5" max="300">
+        <div class="hint">Stops the whole classification run after this time.</div>
+      </div>
+      <div class="field">
+        <label for="s-keepalive">Keep model loaded</label>
+        <input type="text" id="s-keepalive" value="{{ cfg.llm.keep_alive }}" placeholder="5m">
+        <div class="hint">For example, 5m or 1h. Use 0 to unload after each request.</div>
+      </div>
     </div>
   </div>
   <div class="row" style="justify-content:flex-end;gap:8px">
@@ -97,7 +119,7 @@
       <div class="field">
         <label for="s-chars">Body characters sent</label>
         <input type="number" id="s-chars" value="{{ cfg.llm.max_body_chars }}" min="200" max="8000">
-        <div class="hint">Less text sent means lower cost and less exposure.</div>
+        <div class="hint">Less text reduces model work and the content shared with your server.</div>
       </div>
       <div class="field">
         <label for="s-interval">Check every (minutes)</label>
@@ -107,6 +129,11 @@
       </div>
     </div>
     <div class="field-row">
+      <div class="field">
+        <label for="s-concurrency">Concurrent requests</label>
+        <input type="number" id="s-concurrency" value="1" min="1" max="1" readonly>
+        <div class="hint">Requests stay serial to avoid adding work to Ollama's queue.</div>
+      </div>
       <div class="field">
         <label for="s-retain">Keep mail for (days)</label>
         <input type="number" id="s-retain" value="{{ cfg.check.retain_days }}" min="1" max="3650">
@@ -201,9 +228,9 @@
   <div class="card-body">
     <div class="note">
       Sender, subject and the first <strong>{{ cfg.llm.max_body_chars }}</strong> characters of
-      each email body are sent to your configured endpoint. Job-application mail contains real
-      names, phone numbers and salary discussion, and free tiers on model routers commonly
-      log — and sometimes train on — request data.<br><br>
+      each email body are sent to your configured Ollama server, which may be another computer
+      on your LAN. Mailbox connections still contact your email provider. Job-application mail
+      can contain names, phone numbers and salary discussion.<br><br>
       To exclude a sensitive mailbox, pause it on the <a href="/accounts">Accounts</a> page
       rather than deleting it.
     </div>
@@ -321,6 +348,12 @@ function settingsBody() {
   const body = {
     base_url: document.getElementById("s-base").value.trim(),
     model: document.getElementById("s-model").value.trim(),
+    think: document.getElementById("s-think").checked,
+    num_ctx: num("s-context"),
+    timeout_seconds: num("s-timeout"),
+    classification_deadline_seconds: num("s-deadline"),
+    keep_alive: document.getElementById("s-keepalive").value.trim(),
+    concurrency: num("s-concurrency"),
     batch_size: num("s-batch"),
     max_body_chars: num("s-chars"),
     lookback_days: num("s-lookback"),
@@ -329,8 +362,6 @@ function settingsBody() {
   };
   const client = document.getElementById("s-client");
   if (client) body.outlook_client_id = client.value.trim();
-  const token = document.getElementById("s-token").value;
-  if (token) body.token = token;          // blank means "keep the stored one"
   return body;
 }
 
@@ -338,7 +369,6 @@ async function saveSettings(btn) {
   await withBusy(btn, async () => {
     try {
       toast((await api("/api/settings", settingsBody())).message);
-      document.getElementById("s-token").value = "";
       setTimeout(() => location.reload(), 800);
     } catch (e) { toast(e.message, false); }
   });
@@ -349,7 +379,6 @@ async function testModel(btn) {
     try {
       // Save first, so the test uses exactly what is on screen.
       await api("/api/settings", settingsBody());
-      document.getElementById("s-token").value = "";
       toast((await api("/api/settings/test")).message);
     } catch (e) { toast(e.message, false); }
   });

@@ -14,13 +14,14 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .. import config as cfgmod
 from .. import db, outlook_auth, secrets
+from ..analytics import DashboardFilters, dashboard_data
 from ..pipeline import build_source, check_once, reclassify
 from ..sources import IMAPSource, SourceError
 from ..sources.presets import PRESETS, guess_from_email
@@ -71,7 +72,8 @@ TEMPLATES.env.globals["asset_v"] = _asset_version
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 _job_lock = threading.Lock()
-_job: dict = {"running": False, "message": "", "detail": "", "at": None, "ok": True}
+_job: dict = {"running": False, "message": "", "detail": "", "at": None,
+              "ok": True, "stage_started": None}
 
 #: In-flight Outlook device-code sign-in. Memory only — never written to disk.
 #: ``active_id`` names the one flow whose eventual result should be honoured;
@@ -131,7 +133,11 @@ class SettingsBody(BaseModel):
     outlook_client_id: str | None = None
     base_url: str | None = None
     model: str | None = None
-    token: str | None = None
+    num_ctx: int | None = None
+    think: bool | None = None
+    keep_alive: str | None = None
+    timeout_seconds: int | None = None
+    classification_deadline_seconds: int | None = None
     batch_size: int | None = None
     max_body_chars: int | None = None
     concurrency: int | None = None
@@ -176,7 +182,7 @@ def _state(conn=None, accounts=None) -> dict:
         summary = db.queue_counts(conn)
     due = _sched["next_due"]
     return {
-        "llm_ready": cfg.is_llm_ready() and secrets.has_llm_token(),
+        "llm_ready": cfg.is_llm_ready(),
         "has_accounts": any(a.enabled for a in accounts),
         "account_count": len(accounts),
         "urgent_count": summary["actionable"],
@@ -200,13 +206,15 @@ def _start_job(work, *, failed: str, on_finish=None) -> None:
     """
 
     def runner():
-        _job.update(running=True, message="Connecting…", detail="", ok=True)
+        _job.update(running=True, message="Connecting…", detail="", ok=True,
+                    stage_started=time.time())
         try:
             work()
         except Exception as exc:  # noqa: BLE001 - surface it in the UI, never 500
             _job.update(message=failed, detail=str(exc), ok=False)
         finally:
-            _job.update(running=False, at=datetime.now().strftime("%H:%M"))
+            _job.update(running=False, at=datetime.now().strftime("%H:%M"),
+                        stage_started=None)
             if on_finish is not None:
                 on_finish()
             _job_lock.release()
@@ -217,6 +225,20 @@ def _start_job(work, *, failed: str, on_finish=None) -> None:
 def _run_check(body: CheckBody) -> None:
     def work():
         cfg = cfgmod.load()
+
+        def event(values: dict) -> None:
+            if values.get("type") == "llm_request_started":
+                _job.update(
+                    message=(f"Classifying batch {values['batch_index']} of "
+                             f"{values['total_batches']} · {values['completed']} of "
+                             f"{values.get('total', '?')} complete"),
+                    stage_started=time.time(),
+                )
+            elif values.get("type") == "llm_request" and values.get("outcome") in {
+                "timeout", "busy", "deadline"
+            }:
+                _job.update(message="Ollama busy; remaining mail will retry next check")
+
         with db.session() as conn:
             result = check_once(
                 conn,
@@ -228,6 +250,7 @@ def _run_check(body: CheckBody) -> None:
                 progress=lambda done, total: _job.update(
                     message=f"Classifying… {done} of {total}"
                 ),
+                event=event,
             )
         bits = [f"{result.fetched} unread", f"{result.classified} classified"]
         if result.from_cache:
@@ -236,10 +259,12 @@ def _run_check(body: CheckBody) -> None:
             bits.append(f"{result.prefiltered} filtered locally")
         if result.pruned:
             bits.append(f"{result.pruned} aged out")
+        if result.retryable:
+            bits.append(f"{result.retryable} deferred; Ollama busy — retry next check")
         _job.update(
             message=" · ".join(bits),
             detail="\n".join(result.errors[:5]),
-            ok=not result.errors,
+            ok=not result.errors or result.retryable > 0,
         )
 
     # A manual check counts as a check: restart the clock from now.
@@ -249,6 +274,20 @@ def _run_check(body: CheckBody) -> None:
 def _run_reclassify(body: ReclassifyBody) -> None:
     def work():
         cfg = cfgmod.load()
+
+        def event(values: dict) -> None:
+            if values.get("type") == "llm_request_started":
+                _job.update(
+                    message=(f"Re-classifying batch {values['batch_index']} of "
+                             f"{values['total_batches']} · {values['completed']} of "
+                             f"{values.get('total', '?')} complete"),
+                    stage_started=time.time(),
+                )
+            elif values.get("type") == "llm_request" and values.get("outcome") in {
+                "timeout", "busy", "deadline"
+            }:
+                _job.update(message="Ollama busy; remaining mail will retry next check")
+
         with db.session() as conn:
             result = reclassify(
                 conn,
@@ -260,6 +299,7 @@ def _run_reclassify(body: ReclassifyBody) -> None:
                 progress=lambda done, total: _job.update(
                     message=f"Re-classifying… {done} of {total}"
                 ),
+                event=event,
             )
         if not result.fetched:
             _job.update(message="Nothing left to re-classify.", detail="", ok=True)
@@ -315,6 +355,21 @@ def create_app() -> FastAPI:
     app = FastAPI(title="mail-check", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 
+    @app.exception_handler(ValidationError)
+    async def invalid_saved_config(request: Request, exc: ValidationError):
+        # Validation errors may contain old endpoint credentials or other values.
+        # Show recovery instructions without echoing the invalid input.
+        return PlainTextResponse(
+            f"The saved configuration at {cfgmod.config_path()} needs updating.\n\n"
+            "For an old model endpoint, run:\n"
+            "mail-check init --base-url http://192.168.2.230:11440 "
+            "--model qwen3.5:35b-a3b\n\n"
+            "This backs up the existing configuration and preserves other settings. "
+            "If another setting is invalid, correct it in the configuration file, "
+            "then reload this page. Automatic checks cannot run until it is valid.",
+            status_code=503,
+        )
+
     if not _scheduler_started.is_set():
         _scheduler_started.set()
         threading.Thread(target=_scheduler, daemon=True).start()
@@ -328,6 +383,29 @@ def create_app() -> FastAPI:
         return await call_next(request)
 
     # ------------------------------------------------------------------- pages
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def analytics_dashboard(request: Request):
+        with db.session() as conn:
+            accounts = db.list_accounts(conn)
+            state = _state(conn, accounts)
+        return TEMPLATES.TemplateResponse(request, "analytics.html", {
+            "page": "analytics", "main_class": "wide", "accounts": accounts,
+            "categories": CATEGORIES, **state,
+        })
+
+    @app.get("/api/dashboard")
+    def api_dashboard(request: Request):
+        values = dict(request.query_params)
+        values.pop("category", None)
+        values["categories"] = request.query_params.getlist("category")
+        try:
+            filters = DashboardFilters.model_validate(values)
+        except ValidationError as exc:
+            return _err(exc.errors()[0]["msg"])
+        cfg = cfgmod.load()
+        with db.session() as conn:
+            return dashboard_data(conn, filters, retention_days=cfg.check.retain_days)
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(
@@ -563,7 +641,6 @@ def create_app() -> FastAPI:
             "settings.html",
             {
                 "page": "settings",
-                "has_token": secrets.has_llm_token(),
                 "categories": [c for c in CATEGORIES if c.name != "unclassified"],
                 "config_path": str(cfgmod.config_path()),
                 "db_path": str(cfgmod.db_path()),
@@ -625,6 +702,10 @@ def create_app() -> FastAPI:
             # Seconds remaining, so the browser never has to trust its own clock
             # agreeing with the server's.
             "next_in": max(0, int(due - time.time())) if due else None,
+            "stage_elapsed": (
+                max(0, int(time.time() - _job["stage_started"]))
+                if _job["running"] and _job.get("stage_started") else None
+            ),
         }
 
     @app.post("/api/autocheck")
@@ -830,7 +911,11 @@ def create_app() -> FastAPI:
     def api_settings(body: SettingsBody):
         cfg = cfgmod.load()
         data = cfg.model_dump()
-        for field in ("base_url", "model", "batch_size", "max_body_chars", "concurrency"):
+        for field in (
+            "base_url", "model", "batch_size", "max_body_chars", "concurrency",
+            "num_ctx", "think", "keep_alive", "timeout_seconds",
+            "classification_deadline_seconds",
+        ):
             value = getattr(body, field)
             if value is not None:
                 data["llm"][field] = value
@@ -853,8 +938,6 @@ def create_app() -> FastAPI:
             msg = detail()[0]["msg"] if callable(detail) and detail() else str(exc)
             return _err(msg)
         cfgmod.save(cfg)
-        if body.token:
-            secrets.set_llm_token(body.token)
         _reschedule(cfg)  # a changed interval takes effect immediately
         return {"ok": True, "message": "Settings saved."}
 
@@ -866,15 +949,9 @@ def create_app() -> FastAPI:
         if not cfg.is_llm_ready():
             return _err("Set a base URL and model first.")
         try:
-            with LLMClient(
-                base_url=cfg.llm.base_url,
-                token=secrets.get_llm_token(),
-                model=cfg.llm.model,
-                timeout=cfg.llm.timeout_seconds,
-                max_retries=2,
-            ) as client:
+            with LLMClient.from_config(cfg.llm) as client:
                 reply = client.ping()
-        except (LLMError, secrets.SecretError) as exc:
+        except LLMError as exc:
             return _err(str(exc))
         return {"ok": True, "message": f"Model replied: {reply.strip()[:120]}"}
 
@@ -962,7 +1039,8 @@ def _decorate(row) -> dict:
     item = dict(row)
     item["tier"] = tier_of(row["category"])
     item["category_label"] = label_of(row["category"])
-    item["date_display"] = _fmt_date(row["date_utc"])
+    item["date_estimated"] = not bool(row["date_utc"])
+    item["date_display"] = _fmt_date(row["date_utc"] or item.get("fetched_at"))
     item["deadline_display"] = _fmt_deadline(row["deadline"])
     item["open_url"], item["open_label"] = _open_link(row)
     return item

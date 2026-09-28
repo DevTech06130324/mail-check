@@ -1,84 +1,96 @@
-"""OmniRoute client. Assumes an OpenAI-compatible /chat/completions endpoint.
-
-The user supplies base_url, model and auth token; nothing here is provider-specific
-beyond that shape.
-"""
+"""Native Ollama chat client with bounded, queue-safe retries."""
 
 from __future__ import annotations
 
 import json
 import random
 import time
+from dataclasses import dataclass
 
 import httpx
 
+from ..config import LLMConfig, ollama_root
+
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, category: str = "error", attempts: int = 0,
+                 wall_seconds: float = 0.0) -> None:
+        super().__init__(message)
+        self.category = category
+        self.attempts = attempts
+        self.wall_seconds = wall_seconds
 
 
-class RateLimited(LLMError):
-    def __init__(self, retry_after: float | None = None) -> None:
-        super().__init__("Rate limited")
-        self.retry_after = retry_after
+class OllamaBusy(LLMError):
+    """The run must stop because another request may still be queued/running."""
+
+
+@dataclass(frozen=True)
+class OllamaMetrics:
+    total_seconds: float | None = None
+    load_seconds: float | None = None
+    prompt_tokens: int | None = None
+    prompt_seconds: float | None = None
+    output_tokens: int | None = None
+    output_seconds: float | None = None
 
 
 class Completion(str):
-    """The reply text, carrying why the model stopped.
+    """Reply text plus Ollama timing data and client-side request metadata."""
 
-    A ``str`` subclass rather than a wrapper so every existing caller - and
-    every test double that just returns a plain string - keeps working. Read it
-    with ``getattr(raw, "finish_reason", None)``: ``"length"`` means the budget
-    ran out mid-answer, which is worth a retry with more room rather than the
-    same request again.
-    """
-
-    finish_reason: str | None
-
-    def __new__(cls, text: str, finish_reason: str | None = None) -> "Completion":
+    def __new__(cls, text: str, finish_reason: str | None = None, *,
+                metrics: OllamaMetrics | None = None, attempts: int = 1,
+                wall_seconds: float = 0.0) -> "Completion":
         obj = super().__new__(cls, text)
         obj.finish_reason = finish_reason
+        obj.metrics = metrics or OllamaMetrics()
+        obj.attempts = attempts
+        obj.wall_seconds = wall_seconds
         return obj
 
 
 def _endpoint(base_url: str) -> str:
-    base = base_url.strip().rstrip("/")
-    if base.endswith("/chat/completions"):
-        return base
-    return f"{base}/chat/completions"
+    try:
+        base = ollama_root(base_url)
+    except ValueError as exc:
+        raise LLMError(str(exc), category="configuration") from exc
+    if not base:
+        raise LLMError("No Ollama base_url configured. Run: mail-check init", category="configuration")
+    return f"{base}/api/chat"
 
 
 class LLMClient:
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        token: str,
-        model: str,
-        timeout: int = 120,
-        max_retries: int = 4,
-        temperature: float = 0.0,
-        use_json_mode: bool = True,
-    ) -> None:
+    def __init__(self, *, base_url: str, model: str, timeout: int | None = None,
+                 timeout_seconds: int | None = None, max_retries: int = 2,
+                 temperature: float = 0.0, use_json_mode: bool = True,
+                 num_ctx: int = 8192, think: bool = False, keep_alive: str = "5m",
+                 transport: httpx.BaseTransport | None = None) -> None:
         if not base_url:
-            raise LLMError("No base_url configured. Run: mail-check init")
+            raise LLMError("No base_url configured. Run: mail-check init", category="configuration")
         if not model:
-            raise LLMError("No model configured. Run: mail-check init")
+            raise LLMError("No model configured. Run: mail-check init", category="configuration")
         self.url = _endpoint(base_url)
         self.model = model
-        # A caller passing 0 would mean "never even try the request"; config.py
-        # validates against this too, but a hardcoded call site could still hit
-        # it, so it is clamped here as well.
-        self.max_retries = max(1, max_retries)
+        # This value is attempts, despite the historic name. Never allow more
+        # than one retry: more requests amplify an already-busy Ollama queue.
+        self.max_retries = max(1, min(max_retries, 2))
         self.temperature = temperature
         self.use_json_mode = use_json_mode
-        self._client = httpx.Client(
-            timeout=timeout,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+        self.num_ctx = num_ctx
+        self.think = think
+        self.keep_alive = keep_alive
+        self.timeout_seconds = min(
+            60.0,
+            float(timeout_seconds if timeout_seconds is not None else (timeout or 60)),
         )
+        self._client = httpx.Client(timeout=self.timeout_seconds, trust_env=False, transport=transport)
+
+    @classmethod
+    def from_config(cls, cfg: LLMConfig) -> "LLMClient":
+        return cls(base_url=cfg.base_url, model=cfg.model,
+                   timeout_seconds=cfg.timeout_seconds, max_retries=cfg.max_retries,
+                   temperature=cfg.temperature, use_json_mode=cfg.use_json_mode,
+                   num_ctx=cfg.num_ctx, think=cfg.think, keep_alive=cfg.keep_alive)
 
     def close(self) -> None:
         self._client.close()
@@ -89,131 +101,127 @@ class LLMClient:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def complete(
-        self, system: str, user: str, *, json_mode: bool | None = None, max_tokens: int = 2048
-    ) -> Completion:
-        """``json_mode=None`` (the default) defers to ``self.use_json_mode`` —
-        the configured ``llm.use_json_mode`` setting. Pass an explicit bool to
-        override it for one call, as the retry ladder in classify.py does."""
+    def complete(self, system: str, user: str, *, json_mode: bool | None = None,
+                 max_tokens: int = 2048, deadline: float | None = None) -> Completion:
         if json_mode is None:
             json_mode = self.use_json_mode
         payload: dict = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": self.temperature,
-            "max_tokens": max_tokens,
-            # Some proxies stream by default; ask for a whole body. We parse SSE
-            # anyway if they ignore this.
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "options": {"temperature": self.temperature, "num_ctx": self.num_ctx,
+                        "num_predict": max_tokens},
+            "think": self.think,
+            "keep_alive": self.keep_alive,
             "stream": False,
         }
         if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+            payload["format"] = "json"
 
+        started = time.monotonic()
         last_error: Exception | None = None
-        for attempt in range(self.max_retries):
+        for attempt in range(1, self.max_retries + 1):
+            remaining = _remaining(deadline)
+            if remaining is not None and remaining <= 0:
+                raise OllamaBusy(
+                    "Classification deadline reached before an Ollama request could start",
+                    category="deadline", attempts=attempt - 1,
+                    wall_seconds=time.monotonic() - started)
+            request_timeout = min(self.timeout_seconds, remaining) if remaining is not None else self.timeout_seconds
             try:
-                return self._once(payload)
-            except RateLimited as exc:
+                completion = self._once(payload, timeout=max(0.001, request_timeout))
+                completion.attempts = attempt
+                completion.wall_seconds = time.monotonic() - started
+                return completion
+            except httpx.ReadTimeout as exc:
+                raise OllamaBusy(
+                    "Ollama response timed out; the server may still be processing it",
+                    category="timeout", attempts=attempt,
+                    wall_seconds=time.monotonic() - started) from exc
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                if code in (429, 503):
+                    raise OllamaBusy(
+                        f"Ollama is busy (HTTP {code}); remaining mail will retry next check",
+                        category="busy", attempts=attempt,
+                        wall_seconds=time.monotonic() - started) from exc
+                if code not in (500, 502, 504):
+                    raise LLMError(_describe(exc), category="http", attempts=attempt,
+                                   wall_seconds=time.monotonic() - started) from exc
                 last_error = exc
-                delay = exc.retry_after if exc.retry_after else _backoff(attempt)
-                time.sleep(min(delay, 60))
-            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 last_error = exc
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
-                    # 4xx other than 429 will not fix themselves.
-                    raise LLMError(_describe(exc)) from exc
-                time.sleep(_backoff(attempt))
-        raise LLMError(f"Gave up after {self.max_retries} attempts: {last_error}")
+            except httpx.TransportError as exc:
+                raise LLMError(f"Ollama transport error: {exc}", category="transport",
+                               attempts=attempt, wall_seconds=time.monotonic() - started) from exc
+            except LLMError as exc:
+                exc.attempts = attempt
+                exc.wall_seconds = time.monotonic() - started
+                raise
 
-    def _once(self, payload: dict) -> Completion:
-        resp = self._client.post(self.url, json=payload)
-        if resp.status_code == 429:
-            raise RateLimited(_retry_after(resp))
-        if resp.status_code == 400 and "response_format" in resp.text:
-            # Endpoint does not support JSON mode; retry once without it. The
-            # parser downstream copes with prose-wrapped JSON anyway.
-            payload = {k: v for k, v in payload.items() if k != "response_format"}
-            resp = self._client.post(self.url, json=payload)
+            if attempt >= self.max_retries:
+                break
+            delay = _backoff(attempt - 1)
+            remaining = _remaining(deadline)
+            if remaining is not None and remaining <= delay:
+                raise OllamaBusy("Classification deadline reached before the Ollama retry",
+                                 category="deadline", attempts=attempt,
+                                 wall_seconds=time.monotonic() - started) from last_error
+            time.sleep(delay)
+
+        raise LLMError(
+            f"Gave up after {self.max_retries} attempts: {last_error}",
+            category="server" if isinstance(last_error, httpx.HTTPStatusError) else "connect",
+            attempts=self.max_retries, wall_seconds=time.monotonic() - started)
+
+    def _once(self, payload: dict, *, timeout: float) -> Completion:
+        resp = self._client.post(self.url, json=payload, timeout=timeout)
         resp.raise_for_status()
-        body = resp.text
-
-        # Many OpenAI-compatible proxies stream regardless of `stream: false`.
-        if "text/event-stream" in resp.headers.get("content-type", "") or body.lstrip().startswith(
-            "data:"
-        ):
-            content, finish = _collect_sse(body)
-            if not content:
-                raise LLMError(f"Stream carried no content: {body[:600]}")
-            return Completion(content, finish)
-
         try:
             data = resp.json()
         except ValueError as exc:
-            raise LLMError(f"Non-JSON response from {self.url}: {body[:600]}") from exc
-
-        if "error" in data and not data.get("choices"):
-            raise LLMError(f"API error: {data['error']}")
-        try:
-            choice = data["choices"][0]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise LLMError(f"Unexpected response shape: {str(data)[:300]}") from exc
-        content = (choice.get("message") or choice.get("delta") or {}).get("content")
-        if not content:
-            raise LLMError("Model returned empty content")
-        return Completion(content, choice.get("finish_reason"))
+            raise LLMError(f"Non-JSON response from Ollama at {self.url}", category="response") from exc
+        if not isinstance(data, dict):
+            raise LLMError("Unexpected Ollama response: expected an object", category="response")
+        if data.get("error"):
+            raise LLMError(f"Ollama error: {str(data['error'])[:300]}", category="response")
+        message = data.get("message")
+        if not isinstance(message, dict) or data.get("done") is not True:
+            raise LLMError("Unexpected or incomplete Ollama response", category="response")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise LLMError("Ollama returned empty or invalid content", category="response")
+        return Completion(content, data.get("done_reason"), metrics=OllamaMetrics(
+            total_seconds=_ns_seconds(data.get("total_duration")),
+            load_seconds=_ns_seconds(data.get("load_duration")),
+            prompt_tokens=_int_or_none(data.get("prompt_eval_count")),
+            prompt_seconds=_ns_seconds(data.get("prompt_eval_duration")),
+            output_tokens=_int_or_none(data.get("eval_count")),
+            output_seconds=_ns_seconds(data.get("eval_duration"))))
 
     def ping(self) -> Completion:
-        """Cheap round-trip used by `mail-check init` to validate settings."""
-        return self.complete(
-            "You are a health check. Reply with JSON only.",
-            'Reply with exactly: {"ok": true}',
-            json_mode=True,
-            max_tokens=32,
-        )
-
-
-def _collect_sse(body: str) -> tuple[str, str | None]:
-    """Reassemble the text from an SSE chat-completion stream.
-
-    Only `delta.content` is kept: reasoning models also emit `reasoning_content`
-    or `thinking` deltas, which are not part of the answer and would corrupt the
-    JSON we are trying to parse. Returns the text and the last finish_reason
-    seen, so a stream cut short by the token budget is still recognisable.
-    """
-    parts: list[str] = []
-    finish: str | None = None
-    for line in body.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        chunk = line[5:].strip()
-        if not chunk or chunk == "[DONE]":
-            continue
+        reply = self.complete("You are a health check. Reply with JSON only.",
+                              'Reply with exactly: {"ok": true}',
+                              json_mode=True, max_tokens=256)
         try:
-            data = json.loads(chunk)
-        except json.JSONDecodeError:
-            continue
-        for choice in data.get("choices") or []:
-            node = choice.get("delta") or choice.get("message") or {}
-            piece = node.get("content")
-            if piece:
-                parts.append(piece)
-            if choice.get("finish_reason"):
-                finish = choice["finish_reason"]
-    return "".join(parts), finish
+            health = json.loads(reply)
+        except ValueError as exc:
+            raise LLMError("Ollama health check did not return valid JSON", category="response") from exc
+        if not isinstance(health, dict) or health.get("ok") is not True:
+            raise LLMError("Ollama health check did not return ok: true", category="response")
+        return reply
 
 
-def _retry_after(resp: httpx.Response) -> float | None:
-    value = resp.headers.get("retry-after")
-    if not value:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
+def _remaining(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _ns_seconds(value: object) -> float | None:
+    return float(value) / 1_000_000_000 if isinstance(value, (int, float)) else None
+
+
+def _int_or_none(value: object) -> int | None:
+    return int(value) if isinstance(value, (int, float)) else None
 
 
 def _backoff(attempt: int) -> float:
@@ -224,10 +232,8 @@ def _describe(exc: httpx.HTTPStatusError) -> str:
     code = exc.response.status_code
     body = exc.response.text[:300]
     if code == 401:
-        return f"401 Unauthorized - check your auth token. ({body})"
+        return f"401 Unauthorized - this integration expects a token-free Ollama server. ({body})"
     if code == 404:
-        return (
-            f"404 Not Found at {exc.request.url}. Check base_url; it usually ends "
-            f"in /v1. ({body})"
-        )
+        return (f"404 Not Found at {exc.request.url}. Check the Ollama server root and "
+                f"that the selected model is installed. ({body})")
     return f"HTTP {code} from {exc.request.url}: {body}"

@@ -22,6 +22,8 @@
   </span>
 
   <div class="segmented">
+    <a href="/dashboard" class="{{ 'on' if page == 'analytics' }}"
+       {% if page == 'analytics' %}aria-current="page"{% endif %}>Dashboard</a>
     <a href="/" class="{{ 'on' if page == 'triage' }}"
        {% if page == 'triage' %}aria-current="page"{% endif %}>
       Triage{% if urgent_count %}<span class="dot" aria-hidden="true"></span>

@@ -8,7 +8,6 @@ import unicodedata
 import keyring
 
 SERVICE = "mail-check"
-LLM_TOKEN_KEY = "llm-token"
 
 
 class SecretError(RuntimeError):
@@ -79,18 +78,3 @@ def delete_account_password(label: str) -> None:
         keyring.delete_password(SERVICE, _key_for_account(label))
     except keyring.errors.PasswordDeleteError:
         pass
-
-
-def set_llm_token(token: str) -> None:
-    keyring.set_password(SERVICE, LLM_TOKEN_KEY, token)
-
-
-def get_llm_token() -> str:
-    value = keyring.get_password(SERVICE, LLM_TOKEN_KEY)
-    if not value:
-        raise SecretError("No OmniRoute auth token stored. Run: mail-check init")
-    return value
-
-
-def has_llm_token() -> bool:
-    return bool(keyring.get_password(SERVICE, LLM_TOKEN_KEY))

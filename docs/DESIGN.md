@@ -61,7 +61,7 @@ mailcheck/
   normalize.py        # MIME → clean plain text
   prefilter.py        # rule-based noise labelling, pre-LLM
   llm/
-    client.py         # OmniRoute (OpenAI-compatible) + retry/backoff
+    client.py         # native Ollama HTTP API + retry/backoff
     prompt.py         # taxonomy prompt, versioned
     schema.py         # pydantic Classification model
     classify.py       # batching, JSON repair, fallback
@@ -158,7 +158,7 @@ overlapping makes that impossible rather than merely unlikely. The remaining hol
 deliberate and documented: a `--since` reaching past the retention window re-fetches mail
 already pruned, which arrives as new.
 
-IMAP passwords, the LLM token, and serialized Outlook MSAL token caches live in the OS
+IMAP passwords and serialized Outlook MSAL token caches live in the OS
 keyring under distinct `mail-check` entries. The SQLite and TOML files contain no secrets;
 the Microsoft application client ID is a public identifier, not a credential.
 
@@ -185,19 +185,31 @@ Deliberately conservative. A false negative just costs a few tokens; a false pos
 interview invite. Rules only fire on exact sender matches, never on heuristics like the
 presence of a `List-Unsubscribe` header — ATS platforms set that too.
 
-## 8. LLM integration (OmniRoute)
+## 8. LLM integration (Ollama)
 
-OpenAI-compatible `POST {base_url}/chat/completions`. User supplies `base_url`, `auth_token`,
-`model`.
+Native `POST {base_url}/api/chat` through `httpx`. User supplies the Ollama server root
+and an installed model name. No Authorization header or LLM keyring access is used.
+Generic URL/model defaults are empty; legacy `/v1` URLs are rejected with migration guidance.
+`LLMClient.from_config()` keeps the CLI, web connection test, and classification settings aligned.
 
-**Batching.** ~8 emails per request as a JSON array in, JSON array out. Cuts request count ~8×,
-which matters most against free-tier rate limits.
+**Runtime defaults.** Five emails per request, one concurrent request, 8,192 context tokens,
+thinking disabled, a 60-second request timeout, a 300-second classification deadline, and a
+five-minute keep-alive. This installation uses
+`http://192.168.2.230:11440` and `qwen3.5:35b-a3b`. These are initial settings to measure,
+not performance guarantees. Context, thinking, keep-alive, request timeout, and deadline are
+editable in Settings.
 
-**Assume the free model is bad at JSON.** This is the most likely failure mode in production,
-so it gets an explicit ladder:
+**Busy-server recovery.** A read timeout, HTTP 429, or HTTP 503 opens the circuit for the
+current run because Ollama may still be processing or queueing the request. Completed batches
+are preserved; current and remaining mail is stored as retryable `unclassified` and tried by
+the next scheduled check. Connection-establishment failures and HTTP 500/502/504 receive at
+most one retry while the run deadline has time remaining. Permanent parse failures remain
+cached for manual retry. Successful Ollama replies contribute load, prompt, generation, token,
+attempt, and wall-clock metrics to a rotating privacy-safe performance log.
 
-1. Request `response_format: {"type": "json_object"}`; wrap results as `{"results": [...]}`
-   because many endpoints reject a bare array root.
+**JSON recovery.** Malformed or incomplete model output gets an explicit recovery ladder:
+
+1. Request `format: "json"`; wrap results as `{"results": [...]}`.
 2. Strip markdown fences; brace-match to extract the first balanced JSON object if the model
    wraps it in prose. If nothing balances, close the open brackets and re-parse — a reply cut
    off mid-answer still carries the items that arrived before the cut.
@@ -209,16 +221,18 @@ so it gets an explicit ladder:
    whether the reply was cut short or simply unparseable.
 
 Unknown category strings are fuzzy-matched to the nearest known label, else `other`. A batch
-never fails as a unit; one bad item can't take down seven good ones.
+never fails as a unit; one bad item cannot discard the valid results.
 
-**Budget for thinking, not just answering.** Reasoning models spend `max_tokens` on their
-scratchpad before writing any answer — measured at ~1200 reasoning tokens for a batch of
-eight — so every budget here covers thinking plus answer. `finish_reason: "length"` is read
-back and reported as a token limit rather than as missing JSON, and buys a bigger budget on
-the retry instead of a reworded one.
+**Request and response contract.** Send system/user messages with `stream: false`, `think`,
+`keep_alive`, and `options` containing `temperature`, `num_ctx`, and `num_predict`. Per-call
+output budgets become `num_predict`. Read only `message.content` for classification and
+map `done_reason` to `Completion.finish_reason` so truncation recovery retains its signal.
+Thinking output is never treated as the classification answer. `ping()` requires a valid
+JSON health response and allows 256 output tokens.
 
-**Rate limits.** 429 → exponential backoff with jitter, honouring `Retry-After`. Concurrency
-defaults to 1 (free tiers are strict), configurable.
+**Failures.** Transport failures, HTTP 429, and server errors receive bounded retries with
+backoff; `Retry-After` is honoured. Missing models, rejected options, invalid responses, and
+empty content surface as errors. There is no alternate-provider fallback or automatic model pull.
 
 ## 9. Trigger modes
 
@@ -239,7 +253,7 @@ slots in as a new trigger over the unchanged pipeline.
 ### CLI
 
 ```
-mail-check init                     # wizard: OmniRoute base_url / token / model
+mail-check init                     # wizard: Ollama server URL / model
 mail-check account add              # wizard: label, email, provider preset, app password
 mail-check account list | remove | test
 mail-check check [--account L] [--since 7d] [--no-cache] [--json]
@@ -264,9 +278,9 @@ primary daily-triage path.
 
 ## 11. Privacy
 
-**Email bodies are sent to a third-party LLM router.** Job-application mail contains real
-names, phone numbers, and salary discussion. Free tiers on aggregators commonly log — and
-sometimes train on — request data.
+**Sender, subject, and truncated email bodies are sent to the configured Ollama server.**
+The selected server is another computer on the LAN. Mailbox connections still contact the
+email provider. Job-application mail can contain names, phone numbers, and salary discussion.
 
 The tool must state this at `init` time, not bury it. Mitigations available: `max_body_chars`
 limits exposure, the prefilter keeps obvious noise local, and per-account `enabled` lets the
@@ -297,12 +311,9 @@ M2 is the first genuinely useful build; M1 is a checkpoint, not a release.
 
 ## 14. Open questions
 
-1. **OmniRoute API shape** — assumed OpenAI-compatible `/chat/completions`. Needs confirming
-   against the actual docs before `llm/client.py`, particularly whether `response_format` is
-   honoured on free models.
-2. **Model choice** — the taxonomy prompt needs testing against whichever free model is used;
-   weaker models may need the batch size dropped or the taxonomy simplified.
-3. **Threading** — a rejection replying to your own application thread is currently classified
+1. **Model tuning** — measure cold-start and warm-batch duration and classification quality
+   before increasing batch size, context, or concurrency on the selected Ollama server.
+2. **Threading** — a rejection replying to your own application thread is currently classified
    in isolation. Grouping by `In-Reply-To`/`References` would improve accuracy but adds scope.
 
 ## 15. Approved product evolution (2026-07-30)
@@ -445,3 +456,22 @@ and are removed from server memory; they are never written to disk.
 
 - [Daily triage UX](superpowers/plans/2026-07-30-daily-triage-ux.md)
 - [Personal Outlook mail](superpowers/plans/2026-07-30-personal-outlook.md)
+
+## 16. Local email analytics
+
+`/dashboard` is separate from the home triage queue. `GET /api/dashboard` validates a
+single `DashboardFilters` model, then delegates to `mailcheck/analytics.py`. Aggregation
+and pagination use the same parameterized SQL scope and latest-classification join.
+Drill-down adds list-only constraints; overview counts remain unchanged. Search covers
+metadata and classification summaries, never bodies; bodies load through the reader.
+
+Received timestamps are bucketed using IANA timezone calendar boundaries (`zoneinfo`,
+with `tzdata` for Windows). Naive timestamps are UTC, and undated messages use fetch time.
+Separate midnight conversions handle daylight saving. The received-time expression index
+supports a 90-day scope, and pagination orders by timestamp plus message ID for stability.
+
+Chart.js 4.5.1 and its MIT license are bundled locally. A daily-count table supplies
+keyboard-accessible drill-down alternatives. URL state, canceled stale requests, and
+in-place reader action refresh preserve the user's filters. Reading analytics never starts
+a collection or classification job. Installation retention is 90 days; generic defaults
+and mailbox fetch lookback remain unchanged.

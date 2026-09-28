@@ -41,17 +41,41 @@ python -m mailcheck web
 It opens `127.0.0.1:8765` and walks you through setup if nothing is configured yet.
 Prefer the terminal? The same steps are below.
 
-**1. Point it at your model.** Any OpenAI-compatible endpoint (OmniRoute, OpenRouter, …):
+**1. Point it at your Ollama server.** The model must already be installed on that server:
 
 ```bash
 mail-check init
-# OmniRoute base_url: https://your-endpoint/v1
-# Model name:         some/free-model
-# Auth token:         ****
+# Ollama server URL: http://192.168.2.230:11440
+# Model name:        qwen3.5:35b-a3b
 ```
 
-The token goes into Windows Credential Manager, never into a config file. `init` sends a
-test request so you find out immediately if the endpoint is wrong.
+Use the server root with no `/v1` or API path. mail-check uses Ollama's native
+`POST /api/chat` API without an auth token. `init` sends a JSON health request to test it.
+Generic configuration leaves the URL and model empty until you choose them.
+
+For this LAN server, start with these settings:
+
+```bash
+mail-check config set llm.num_ctx 8192
+mail-check config set llm.think false
+mail-check config set llm.batch_size 5
+mail-check config set llm.concurrency 1
+mail-check config set llm.timeout_seconds 60
+mail-check config set llm.classification_deadline_seconds 300
+mail-check config set llm.keep_alive 5m
+```
+
+When migrating an existing installation, stop `watch` and pause automatic checks.
+An old `/v1` endpoint prevents Settings from loading; recover it from the terminal:
+
+```bash
+mail-check init --base-url http://192.168.2.230:11440 --model qwen3.5:35b-a3b
+```
+
+This backs up the existing configuration, replaces the endpoint and model, and tests
+the connection. Apply the runtime settings above before restoring your schedule. Mailboxes,
+local rules, privacy acknowledgement, stored messages, and Done states are preserved.
+Old router credentials can remain in the OS keyring; mail-check no longer reads them.
 
 **2. Add a mailbox:**
 
@@ -84,7 +108,7 @@ mail-check watch -i 30
 mail-check web                    # management console on 127.0.0.1:8765
 
 mail-check account list | test <label> | remove <label> | enable <label> --off
-mail-check config show | set llm.batch_size 4 | set check.retain_days 30 | token | test
+mail-check config show | set llm.batch_size 5 | set check.retain_days 30 | test
 ```
 
 ## The console
@@ -103,7 +127,9 @@ Three pages, all of it local:
 - **Completed** — what you've marked Done, with Restore.
 - **Accounts** — connect an IMAP mailbox with an app password, or sign in to a personal
   Outlook account with Microsoft. Test, pause, or remove any of them.
-- **Settings** — endpoint, model and token; automatic checks; batch size, body length,
+- **Settings** — Ollama server and model; thinking, context, keep-alive, request timeout,
+  and classification deadline;
+  automatic checks; batch size, concurrency, body length,
   lookback, retention and interval; and local sender rules that label mail before it
   ever reaches the model.
 
@@ -141,38 +167,49 @@ For a scheduled run, point Task Scheduler or cron at `mail-check check` — that
 Each email also gets **company, role, deadline, action_required and a one-line summary**
 extracted, which is what turns the report into a to-do list.
 
-## Cost and reliability
+## Performance and reliability
 
 Classification is cached in SQLite keyed by `(message_id, model, prompt_version)`, so
-re-running costs nothing. Changing the model or bumping `PROMPT_VERSION` transparently
-forces a re-classify.
+re-running skips inference for cached messages. Changing the model or bumping
+`PROMPT_VERSION` uses fresh classifications on the next check; old cache records remain.
 
-Emails go to the model **8 per request** with bodies stripped of HTML, quoted replies and
+Emails go to the model **4 per request** by default with bodies stripped of HTML, quoted replies and
 footer boilerplate, then truncated to 1200 characters. Known job-board senders are labelled
 locally and never sent at all.
 
-Free models are unreliable at JSON, so the parser expects that: it strips code fences,
+Models can return malformed JSON, so the parser handles it: it strips code fences,
 pulls JSON out of surrounding prose, accepts results either listed or keyed by id, and
 closes a reply that stopped mid-answer so the fields that did arrive still count. Each item
 is validated on its own; missing ones are retried singly with more room and a stricter
 prompt, and only then does it fall back to `unclassified`. One malformed entry cannot cost
-you the other seven.
+you the other results.
 
-Most "free" models are reasoning models, and their thinking is charged against the same
-token budget as their answer — thinking about eight emails can cost ~1200 tokens before a
-character of JSON is written. The budgets here are sized for that. If a run reports items
-hitting the token limit, send fewer at a time:
+Thinking starts disabled and can be enabled for a supporting model in Settings or with
+`mail-check config set llm.think true`. Larger batches, contexts, and thinking can increase
+memory use and response time. Output budgets map to Ollama's `num_predict`; truncated
+responses retain their completion reason for recovery. If results hit the token limit,
+send fewer at a time:
 
 ```bash
-mail-check config set llm.batch_size 4
+mail-check config set llm.batch_size 2
 ```
+
+A single Ollama request defaults to 60 seconds, and the complete classification stage
+defaults to five minutes. A read timeout, HTTP 429, or HTTP 503 opens the busy-server
+circuit: unresolved mail stays visible as `unclassified` and is retried by the next
+scheduled check. Successful and permanently malformed results remain cached.
+
+Privacy-safe performance records are written to `performance.jsonl` in the application
+data directory. The log rotates at 2 MB with three backups and contains timings, token
+counts, batch sizes, and error categories only. It never records subjects, addresses,
+bodies, prompts, credentials, or model output.
 
 ## Privacy
 
-**Email bodies are sent to whatever endpoint you configure.** Job-application mail contains
-real names, phone numbers and salary discussion, and free tiers on model routers commonly
-log — and sometimes train on — request data. Decide if that is acceptable before pointing
-this at a mailbox.
+**Sender, subject, and truncated email bodies are sent to your configured Ollama server.**
+With the LAN configuration above, inference runs on `192.168.2.230`; mailbox connections
+still contact your email provider. Job-application mail can contain names, phone numbers,
+and salary discussion. Local prefilter rules keep matching messages off the model server.
 
 You can exclude a sensitive mailbox without deleting it:
 
@@ -199,12 +236,27 @@ read, move it, label it, or change anything in Gmail or Outlook — provider mai
 read. Re-running a check never resurrects something you finished, and Completed can restore
 it for as long as the message is kept.
 
-## Mail ages out after a week
+## Email analytics dashboard
+
+Open **Dashboard** to explore locally collected mail by received date. Daily category charts,
+summary cards, and a searchable 50-item email list share account, category, status, action,
+and date filters. Select a chart segment to narrow the list to a day and category. Filters
+remain in the URL, and the existing reader supports Done, Restore, and classification retry.
+
+Ranges cover up to 90 inclusive calendar days in the browser's timezone. Missing received
+dates use collection time and are marked estimated. Dates before the first completed
+collection are marked partial: deleted mail and previously uncollected mail are unavailable.
+Browsing uses stored SQLite data and makes no mailbox or model requests.
+
+This installation retains 90 days of local history. It starts with stored mail and future
+checks; it does not backfill old mailbox messages or widen the fetch window.
+
+## Local retention
 
 The local database is a rolling window, not an archive. **Every check deletes triaged mail
-older than seven days**, Completed included, so a queue you have been running for months
-does not turn into a pile of stored email bodies. A triage list older than a week has
-either been dealt with or is not going to be.
+older than the configured retention window**, Completed included, so a queue you have been running for months
+does not turn into an unlimited archive. New configurations default to seven days;
+the retention setting controls how much local history the dashboard can show.
 
 ```bash
 mail-check config set check.retain_days 30    # keep a month instead
@@ -245,6 +297,8 @@ Microsoft 365 work and school accounts are out of scope.
 
 ```bash
 python tests/test_smoke.py
+python -m unittest discover -s tests
+python -m tests.benchmark_analytics
 ```
 
 Runs the whole pipeline against a fake mailbox and a fake model — including the malformed-JSON
