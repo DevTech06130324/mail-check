@@ -82,6 +82,19 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe("triage interactions", () => {
+  it("keeps rendering after completing the final message in the queue", async () => {
+    renderPage()
+    const first = await screen.findByRole("option", { name: /Summary 1/ })
+    first.focus()
+    fireEvent.keyDown(first, { key: "e" })
+    await waitFor(() => expect(screen.queryByRole("option", { name: /Summary 1/ })).toBeNull())
+    const last = screen.getByRole("option", { name: /Summary 2/ })
+    last.focus()
+    fireEvent.keyDown(last, { key: "e" })
+    expect(await screen.findByText("Your queue is clear")).toBeTruthy()
+    expect(screen.queryByRole("option")).toBeNull()
+  })
+
   it("loads the selected reader and follows arrow-key focus", async () => {
     renderPage()
     expect(await screen.findByText("Interview 1")).toBeTruthy()

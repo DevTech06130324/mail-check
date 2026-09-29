@@ -108,7 +108,11 @@ function JobStatus({ bootstrap }: { bootstrap: Bootstrap }) {
     ? `${Math.floor(status.next_in / 60)}:${String(status.next_in % 60).padStart(2, "0")}` : null
   return <div className="top-actions">
     <span className={`connection-status ${status?.running ? "is-running" : ""}`} aria-live="polite">
-      {status?.running ? <><LoaderCircle className="spin" size={15} />{status.message || "Checking mail…"}</> : <><span className="status-dot" />{countdown ? <>Next check <strong className="tabular">{countdown}</strong></> : "All systems ready"}</>}
+      {status?.running ? <LoaderCircle className="spin" size={15} /> : <span className="status-dot" />}
+      {/* Keep changing text in its own element: translators may replace text
+          nodes, so removing a bare text sibling can crash React reconciliation. */}
+      <span>{status?.running ? status.message || "Checking mail…" : countdown ? "Next check" : "All systems ready"}</span>
+      {!status?.running && countdown && <strong className="tabular">{countdown}</strong>}
     </span>
     <button className="schedule-button" type="button" onClick={toggle} title="Toggle automatic checks">{status?.auto ? "Pause schedule" : "Schedule"}</button>
     <Button onClick={runCheck} disabled={status?.running || !bootstrap.readiness.model || !bootstrap.readiness.accounts}>{status?.running ? <LoaderCircle className="spin" /> : <Plus />}<span>{status?.running ? "Checking" : "Check now"}</span></Button>

@@ -456,7 +456,9 @@ def create_app() -> FastAPI:
     def frontend_page():
         index = FRONTEND_DIST / "index.html"
         if index.is_file():
-            return FileResponse(index)
+            # The shell points at content-hashed assets. Always revalidate the
+            # shell so a browser cannot keep references from an older build.
+            return FileResponse(index, headers={"Cache-Control": "no-cache, must-revalidate"})
         return None
 
     @app.exception_handler(ValidationError)
@@ -1206,7 +1208,7 @@ def create_app() -> FastAPI:
             requested = (FRONTEND_DIST / path).resolve()
             if requested.is_relative_to(FRONTEND_DIST.resolve()) and requested.is_file():
                 return FileResponse(requested)
-            return FileResponse(index)
+            return FileResponse(index, headers={"Cache-Control": "no-cache, must-revalidate"})
         return JSONResponse({"ok": False, "error": "Not found."}, status_code=404)
 
     return app

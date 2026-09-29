@@ -38,6 +38,14 @@ class FrontendApiTests(unittest.TestCase):
         self.client = TestClient(create_app())
         self.addCleanup(self.client.close)
 
+    def test_spa_shell_revalidates_html_and_contains_a_boot_recovery_message(self):
+        response = self.client.get("/?view=queue&days=30")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("no-cache", response.headers.get("cache-control", ""))
+        self.assertIn("Starting mail-check", response.text)
+        self.assertIn("reload this page", response.text)
+
     def add_message(self, key, *, category="interview_invite", done=False):
         message = NormalizedMessage(
             account_id=self.account_id,
