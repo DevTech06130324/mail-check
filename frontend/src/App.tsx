@@ -72,7 +72,7 @@ function JobStatus({ bootstrap }: { bootstrap: Bootstrap }) {
               for (const item of pending.items) {
                 try {
                   const alert = new Notification(`${item.title} · ${item.who}`, { body: item.summary, tag: String(item.pk) })
-                  alert.onclick = () => { window.focus(); window.location.href = item.url }
+                  alert.onclick = () => { window.open(item.url, "_blank", "noopener"); }
                   shown.push(item.pk)
                 } catch { /* Do not acknowledge a notification the browser rejected. */ }
               }

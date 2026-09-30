@@ -12,7 +12,7 @@ from typing import Iterator
 from . import config
 from .models import Classification, NormalizedMessage
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: ``INSERT ... RETURNING`` needs SQLite 3.35 (2021). Python 3.11 bundles far
 #: newer than that everywhere we run, but the two-statement fallback costs
@@ -140,6 +140,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    # imap_tools reports an unparseable Date header as 1900-01-01 rather than
+    # None. Such rows were being pruned as ancient and hidden from every date
+    # window; an unknown date is NULL, which falls back to fetched_at.
+    conn.execute("UPDATE messages SET date_utc = NULL WHERE date_utc < '1971'")
     conn.commit()
 
 
@@ -316,14 +320,19 @@ def pending_notifications(
     categories: list[str],
     *,
     limit: int = 20,
+    since_iso: str | None = None,
 ) -> list[sqlite3.Row]:
-    """Urgent, unhandled mail the browser has not announced yet."""
+    """Urgent, unhandled mail the browser has not announced yet.
+
+    ``since_iso`` keeps an alert from pointing at mail the queue's own date
+    window would not show.
+    """
     if not categories:
         return []
     sql = (
         """
         SELECT m.id AS pk, m.subject, m.message_id, m.provider_url,
-               a.provider, a.imap_host, c.category, c.company, c.role, c.summary, c.deadline
+               a.provider, a.imap_host, a.email AS account_email, c.category, c.company, c.role, c.summary, c.deadline
         FROM messages m
         JOIN accounts a ON a.id = m.account_id
         """
@@ -332,11 +341,13 @@ def pending_notifications(
         WHERE m.handled_at IS NULL
           AND m.web_notified = 0
           AND c.category IN ({','.join('?' * len(categories))})
-        ORDER BY m.date_utc DESC
+        {"AND COALESCE(m.date_utc, m.fetched_at) >= ?" if since_iso else ""}
+        ORDER BY COALESCE(m.date_utc, m.fetched_at) DESC
         LIMIT ?
     """
     )
-    return list(conn.execute(sql, [*categories, limit]))
+    params = [*categories, *([since_iso] if since_iso else []), limit]
+    return list(conn.execute(sql, params))
 
 
 def mark_announced(conn: sqlite3.Connection, pks: list[int]) -> None:
@@ -380,7 +391,8 @@ def prune_messages(conn: sqlite3.Connection, *, before_iso: str) -> int:
 
     Mail with no Date header ages out on when it was fetched instead, so a
     missing header cannot buy a message an indefinite stay. Both columns hold
-    timezone-aware UTC ISO strings, which order correctly as text — the same
+    UTC ISO strings (``date_utc`` naive, ``fetched_at`` with an offset), which
+    order correctly as text at the precision a cutoff needs — the same
     comparison every query in this module already makes against a cutoff.
     """
     cur = conn.execute(
@@ -537,6 +549,11 @@ def last_run(conn: sqlite3.Connection) -> sqlite3.Row | None:
 #: which is O(revisions) rows discarded per message. Matching the primary key
 #: directly means the subquery (covered by ``idx_class_latest``) resolves to a
 #: single id and the join is one row lookup.
+#: When a message counts as having arrived: its Date header, or the time it was
+#: fetched when the header is missing or unparseable. Every date window uses
+#: this, so undated mail is neither hidden nor immortal.
+RECEIVED = "COALESCE(m.date_utc, m.fetched_at)"
+
 LATEST_CLASSIFICATION = """
         JOIN classifications c ON c.id = (
             SELECT id FROM classifications
@@ -564,7 +581,7 @@ def category_counts(
     )
     params: list = []
     if since_iso:
-        sql += " AND m.date_utc >= ?"
+        sql += f" AND {RECEIVED} >= ?"
         params.append(since_iso)
     if account_label:
         sql += " AND a.label = ?"
@@ -599,7 +616,7 @@ def query_triaged(
         """
         SELECT m.id AS pk, m.message_id, m.subject, m.from_addr, m.from_name,
                m.date_utc, m.snippet, m.provider_url, m.handled_at,
-               a.label AS account_label, a.provider, a.imap_host,
+               a.label AS account_label, a.email AS account_email, a.provider, a.imap_host,
                c.category, c.confidence, c.company, c.role, c.deadline,
                c.action_required, c.summary, c.source, c.retryable, c.created_at
         FROM messages m
@@ -616,15 +633,15 @@ def query_triaged(
         sql += " AND a.label = ?"
         params.append(account_label)
     if since_iso:
-        sql += " AND m.date_utc >= ?"
+        sql += f" AND {RECEIVED} >= ?"
         params.append(since_iso)
     if handled is True:
         sql += " AND m.handled_at IS NOT NULL"
     elif handled is False:
         sql += " AND m.handled_at IS NULL"
     # Completed reads best most-recently-finished first; everything else by date.
-    sql += " ORDER BY m.handled_at DESC, m.date_utc DESC LIMIT ?" if handled else \
-           " ORDER BY m.date_utc DESC LIMIT ?"
+    sql += f" ORDER BY m.handled_at DESC, {RECEIVED} DESC LIMIT ?" if handled else \
+           f" ORDER BY {RECEIVED} DESC LIMIT ?"
     params.append(limit)
     return list(conn.execute(sql, params))
 
@@ -659,7 +676,7 @@ def get_triaged(conn: sqlite3.Connection, pk: int) -> sqlite3.Row | None:
         """
         SELECT m.id AS pk, m.message_id, m.subject, m.from_addr, m.from_name,
                m.date_utc, m.fetched_at, m.snippet, m.body_text, m.provider_url, m.handled_at,
-               a.label AS account_label, a.provider, a.imap_host,
+               a.label AS account_label, a.email AS account_email, a.provider, a.imap_host,
                c.category, c.confidence, c.company, c.role, c.deadline,
                c.action_required, c.summary, c.source, c.retryable, c.created_at
         FROM messages m
@@ -700,7 +717,7 @@ def queue_counts(
     )
     params: list = []
     if since_iso:
-        sql += " AND m.date_utc >= ?"
+        sql += f" AND {RECEIVED} >= ?"
         params.append(since_iso)
     if account_label:
         sql += " AND a.label = ?"
@@ -755,8 +772,8 @@ def messages_in_categories(
         sql += " AND a.label = ?"
         params.append(account_label)
     if since_iso:
-        sql += " AND m.date_utc >= ?"
+        sql += f" AND {RECEIVED} >= ?"
         params.append(since_iso)
-    sql += " ORDER BY m.date_utc DESC LIMIT ?"
+    sql += f" ORDER BY {RECEIVED} DESC LIMIT ?"
     params.append(limit)
     return list(conn.execute(sql, params))

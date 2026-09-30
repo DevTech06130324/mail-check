@@ -894,14 +894,19 @@ def test_action_queue(msgs):
 
         print("\nrelative dates")
         now = datetime.now()
+        # Stored dates are naive UTC, so relative dates are built from UTC.
+        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
         check("future date -> Tomorrow",
-              _fmt_date((now + timedelta(days=1)).isoformat()) == "Tomorrow")
+              _fmt_date((utc_now + timedelta(days=1)).isoformat()) == "Tomorrow")
         check("future date -> In N days",
-              _fmt_date((now + timedelta(days=3)).isoformat()) == "In 3 days")
+              _fmt_date((utc_now + timedelta(days=3)).isoformat()) == "In 3 days")
         check("never renders a negative age",
-              "-" not in _fmt_date((now + timedelta(days=2)).isoformat()))
+              "-" not in _fmt_date((utc_now + timedelta(days=2)).isoformat()))
         check("past date -> Yesterday",
-              _fmt_date((now - timedelta(days=1)).isoformat()) == "Yesterday")
+              _fmt_date((utc_now - timedelta(days=1)).isoformat()) == "Yesterday")
+        check("a UTC time is shown in local time",
+              _fmt_date(utc_now.isoformat())
+              == utc_now.replace(tzinfo=timezone.utc).astimezone().strftime("%H:%M"))
         check("overdue deadline flagged", "Overdue" in _fmt_deadline("2020-01-01"))
         check("deadline today", _fmt_deadline(now.strftime("%Y-%m-%d")) == "Due today")
 

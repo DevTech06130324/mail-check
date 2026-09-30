@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import threading
 import time
+import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from .. import config as cfgmod
 from .. import db, outlook_auth, secrets
@@ -71,7 +72,9 @@ def _asset_version() -> str:
 #: per render cost nothing on a single-user local app.
 TEMPLATES.env.globals["asset_v"] = _asset_version
 
-_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+#: ``testserver`` is Starlette's TestClient host; it is not resolvable on a real
+#: network, so allowing it costs nothing.
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "testserver"}
 
 _job_lock = threading.Lock()
 _job: dict = {"running": False, "message": "", "detail": "", "at": None,
@@ -83,6 +86,10 @@ _job: dict = {"running": False, "message": "", "detail": "", "at": None,
 #: superseded attempt can never save a token or create an account after the
 #: fact — see the staleness checks in ``api_outlook_start``.
 _outlook: dict = {"pending": None, "active_id": None, "state": "idle", "message": "", "email": ""}
+#: Makes "is this flow still the active one?" and "save the account" one step.
+#: Without it a cancel landing between the two leaves an account behind that
+#: the user just cancelled.
+_outlook_lock = threading.Lock()
 
 #: Wall-clock epoch seconds of the next automatic check, or None when auto is off.
 _sched: dict = {"next_due": None}
@@ -103,7 +110,7 @@ def _reschedule(cfg=None) -> None:
 
 class CheckBody(BaseModel):
     account: str | None = None
-    since_days: int | None = None
+    since_days: int | None = Field(default=None, ge=1, le=3650)
     no_cache: bool = False
 
 
@@ -113,7 +120,7 @@ class ReclassifyBody(BaseModel):
 
     pks: list[int] | None = None
     account: str | None = None
-    days: int | None = None
+    days: int | None = Field(default=None, ge=1, le=3650)
 
 
 class AccountBody(BaseModel):
@@ -268,14 +275,14 @@ def _state(conn=None, accounts=None) -> dict:
     if conn is None:
         with db.session() as own:
             accounts = db.list_accounts(own)
-            summary = db.queue_counts(own)
+            summary = db.queue_counts(own, since_iso=_default_since())
     else:
         if accounts is None:
             accounts = db.list_accounts(conn)
         # Same definition as the queue itself (unhandled act/reply/unknown), so
         # the nav dot means exactly "there is something in your queue" — not a
         # lifetime count that includes mail already marked Done.
-        summary = db.queue_counts(conn)
+        summary = db.queue_counts(conn, since_iso=_default_since())
     due = _sched["next_due"]
     return {
         "llm_ready": cfg.is_llm_ready(),
@@ -290,6 +297,15 @@ def _state(conn=None, accounts=None) -> dict:
 
 
 URGENT_CATEGORIES = [c.name for c in CATEGORIES if c.tier == TIER_ACT]
+
+#: The queue's default window (``days=30``). The nav badge and bootstrap counts
+#: use the same one, so the number on the badge is the number the queue shows —
+#: mail older than that can outlive it locally when ``retain_days`` is larger.
+DEFAULT_DAYS = 30
+
+
+def _default_since() -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=DEFAULT_DAYS)).isoformat()
 
 
 def _start_job(work, *, failed: str, on_finish=None) -> None:
@@ -461,6 +477,15 @@ def create_app() -> FastAPI:
             return FileResponse(index, headers={"Cache-Control": "no-cache, must-revalidate"})
         return None
 
+    @app.exception_handler(tomllib.TOMLDecodeError)
+    async def unreadable_config(request: Request, exc: tomllib.TOMLDecodeError):
+        # The parser's message can quote the offending line, so it is not echoed.
+        return PlainTextResponse(
+            f"The saved configuration at {cfgmod.config_path()} is not valid TOML.\n\n"
+            "Fix or delete the file, then reload this page.",
+            status_code=503,
+        )
+
     @app.exception_handler(ValidationError)
     async def invalid_saved_config(request: Request, exc: ValidationError):
         # Validation errors may contain old endpoint credentials or other values.
@@ -482,6 +507,12 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def same_origin_only(request: Request, call_next):
+        # DNS rebinding: a page on an attacker's domain that resolves to
+        # 127.0.0.1 makes same-origin GETs to this server, and the Origin check
+        # below never sees them. Its requests still carry the attacker's Host.
+        host = urlparse("//" + request.headers.get("host", "")).hostname or ""
+        if host not in _LOCAL_HOSTS:
+            return _err("Unrecognised Host header.", 403)
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin")
             if origin and (urlparse(origin).hostname or "") not in _LOCAL_HOSTS:
@@ -523,7 +554,7 @@ def create_app() -> FastAPI:
             accounts = db.list_accounts(conn)
             state = _state(conn, accounts)
             run = db.last_run(conn)
-            summary = db.queue_counts(conn)
+            summary = db.queue_counts(conn, since_iso=_default_since())
         return {
             "readiness": {
                 "model": state["llm_ready"],
@@ -629,7 +660,7 @@ def create_app() -> FastAPI:
         view: str = "queue",
         category: str | None = None,
         account: str | None = None,
-        days: int = 30,
+        days: int = Query(30, ge=1, le=3650),
     ):
         """One template, three views.
 
@@ -722,7 +753,7 @@ def create_app() -> FastAPI:
         error, or the tab closing mid-flight.
         """
         with db.session() as conn:
-            rows = db.pending_notifications(conn, URGENT_CATEGORIES)
+            rows = db.pending_notifications(conn, URGENT_CATEGORIES, since_iso=_default_since())
             items = [
                 {
                     "pk": r["pk"],
@@ -760,7 +791,7 @@ def create_app() -> FastAPI:
             if not row:
                 return _err("No such message.", 404)
             db.set_handled(conn, pk, done)
-            summary = db.queue_counts(conn)
+            summary = db.queue_counts(conn, since_iso=_default_since())
         return {
             "ok": True,
             "message": "Marked done." if done else "Restored to the queue.",
@@ -783,7 +814,7 @@ def create_app() -> FastAPI:
             if not row:
                 return {"ok": True, "pk": None, "message": "Nothing to undo."}
             db.set_handled(conn, row["pk"], False)
-            summary = db.queue_counts(conn)
+            summary = db.queue_counts(conn, since_iso=_default_since())
         subject = (row["subject"] or "").strip()
         return {
             "ok": True,
@@ -1059,9 +1090,10 @@ def create_app() -> FastAPI:
         except outlook_auth.OutlookAuthError as exc:
             return _err(str(exc))
 
-        _outlook.update(
-            pending=pending, active_id=pending.id, state="waiting", message="", email=""
-        )
+        with _outlook_lock:
+            _outlook.update(
+                pending=pending, active_id=pending.id, state="waiting", message="", email=""
+            )
 
         def wait():
             flow_id = pending.id
@@ -1084,17 +1116,19 @@ def create_app() -> FastAPI:
             # Success — but if this flow was cancelled or superseded while we
             # were blocked, the cancellation is authoritative: the token we
             # just saved must not survive, and the account must not appear.
-            if _outlook.get("active_id") != flow_id:
-                outlook_auth.delete_cache(label)
-                return
-            with db.session() as conn:
-                if not db.get_account(conn, label):
-                    db.add_account(
-                        conn, label=label, email=email or label, provider="outlook"
-                    )
-            _outlook.update(
-                pending=None, state="connected", email=email, message=f"Connected {email}."
-            )
+            with _outlook_lock:
+                if _outlook.get("active_id") != flow_id:
+                    outlook_auth.delete_cache(label)
+                    return
+                with db.session() as conn:
+                    if not db.get_account(conn, label):
+                        db.add_account(
+                            conn, label=label, email=email or label, provider="outlook"
+                        )
+                _outlook.update(
+                    pending=None, state="connected", email=email,
+                    message=f"Connected {email}.",
+                )
 
         threading.Thread(target=wait, daemon=True).start()
         return {
@@ -1126,11 +1160,15 @@ def create_app() -> FastAPI:
 
     @app.post("/api/outlook/cancel")
     def api_outlook_cancel():
-        pending = _outlook.get("pending")
-        if pending is not None:
-            outlook_auth.abort(pending)              # unblocks the background thread
-            outlook_auth.delete_cache(pending.label)  # in case it already wrote one
-        _outlook.update(pending=None, active_id=None, state="idle", message="", email="")
+        with _outlook_lock:
+            if _outlook["state"] == "connected":
+                # The sign-in finished first; the account exists and is kept.
+                return {"ok": True, "message": "Already connected."}
+            pending = _outlook.get("pending")
+            if pending is not None:
+                outlook_auth.abort(pending)              # unblocks the background thread
+                outlook_auth.delete_cache(pending.label)  # in case it already wrote one
+            _outlook.update(pending=None, active_id=None, state="idle", message="", email="")
         return {"ok": True, "message": "Sign-in cancelled."}
 
     @app.post("/api/settings")
@@ -1183,6 +1221,8 @@ def create_app() -> FastAPI:
 
     @app.post("/api/rules")
     def api_add_rule(body: RuleBody):
+        if body.category not in {c.name for c in CATEGORIES} or body.category == UNCLASSIFIED:
+            return _err("Choose one of the listed categories.")
         if not (body.sender or body.sender_domain or body.subject_contains):
             return _err("A rule needs at least one condition.")
         cfg = cfgmod.load()
@@ -1201,6 +1241,8 @@ def create_app() -> FastAPI:
 
     @app.get("/{path:path}", include_in_schema=False)
     def frontend_route(path: str):
+        if path == "api" or path.startswith("api/"):
+            return _err("Not found.", 404)
         # Let the SPA own deep links only after it has been built. The legacy
         # template UI remains available in editable Python installs until then.
         if FRONTEND_DIST.is_dir() and (FRONTEND_DIST / "index.html").is_file():
@@ -1231,7 +1273,12 @@ def _fmt_date(value: str | None) -> str:
         dt = datetime.fromisoformat(value)
     except ValueError:
         return value[:16]
-    dt = dt.replace(tzinfo=None)
+    # Stored dates are UTC — ``date_utc`` as a naive value, ``fetched_at`` with an
+    # offset. Convert to local time before comparing against the local clock,
+    # or "today" and "Yesterday" flip at the wrong hour and times read as UTC.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone().replace(tzinfo=None)
     now = datetime.now()
     days = (dt.date() - now.date()).days
 
@@ -1302,8 +1349,12 @@ def _open_link(row) -> tuple[str | None, str]:
 
     host = ((row["imap_host"] if "imap_host" in keys else "") or "").lower()
     if "gmail" in host or "google" in host:
+        # /u/0/ is whichever Google account is signed in first, which is not
+        # necessarily this mailbox; authuser names the account explicitly.
+        email = (row["account_email"] if "account_email" in keys else "") or ""
+        account = f"?authuser={quote(email, safe='')}" if email else ""
         return (
-            "https://mail.google.com/mail/u/0/#search/rfc822msgid:"
+            f"https://mail.google.com/mail/{account}#search/rfc822msgid:"
             f"{quote(row['message_id'])}",
             "Open in Gmail",
         )

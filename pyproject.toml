@@ -21,6 +21,9 @@ dependencies = [
     "tzdata>=2025.2",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 mail-check = "mailcheck.cli:main"
 
