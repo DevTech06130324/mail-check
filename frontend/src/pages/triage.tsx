@@ -4,7 +4,7 @@ import { ArrowLeft, ArrowUpRight, CalendarClock, Check, ChevronDown, Clock3, Fil
 import { api, triageParams } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { CategoryBadge, EmptyState, Loading, PageHeading, useDoneMutation, useToast, useUndoShortcut } from "@/components/common"
+import { CategoryBadge, EmptyState, Loading, PageHeading, modKey, useDoneMutation, useToast, useUndoShortcut } from "@/components/common"
 import type { Bootstrap, Message, TriageData } from "@/lib/types"
 
 function PersonLine({ message }: { message: Message }) {
@@ -40,6 +40,41 @@ export function Reader({ message, mobile, onBack, onDone, busy, canRetry = false
       {isPending ? <Loading label="Opening message…" /> : error ? <div className="inline-error">{error instanceof Error ? error.message : "Could not open this message."}</div> : <div className="email-body" dangerouslySetInnerHTML={{ __html: data?.body_html || "<p>No message body was stored.</p>" }} />}
     </div>
   </article>
+}
+
+/** Sits above the mail explorer while mail is stuck as "unclassified".
+ *
+ * The retry runs on the server as a background job, so the banner follows that
+ * job instead of only toasting: it shows live progress and keeps the button
+ * disabled until the run ends. The triage list itself is refreshed by the
+ * app-wide status poll when the job completes, which is what drops the count. */
+function ReclassifyBanner({ count }: { count: number }) {
+  const queryClient = useQueryClient()
+  const toast = useToast()
+  const [starting, setStarting] = useState(false)
+  const [pollUntil, setPollUntil] = useState(0)
+  // A just-started job may not have flipped `running` yet; keep polling briefly so the banner does not miss it.
+  const status = useQuery({ queryKey: ["status"], queryFn: api.status, refetchInterval: (query) => query.state.data?.running || Date.now() < pollUntil ? 1500 : false })
+  const running = Boolean(status.data?.running)
+  const busy = starting || running
+  const retry = async () => {
+    if (busy) return
+    setStarting(true)
+    try {
+      await api.post("/api/reclassify", {})
+      setPollUntil(Date.now() + 8000)
+      await queryClient.invalidateQueries({ queryKey: ["status"] })
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not start retry.", "error") }
+    finally { setStarting(false) }
+  }
+  return <div className={`attention-banner ${busy ? "is-busy" : ""}`} role="status" aria-live="polite">
+    <span className="attention-icon">{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}</span>
+    <div className="attention-copy">
+      <strong>{count.toLocaleString()} message{count === 1 ? " needs" : "s need"} a closer look</strong>
+      <span>{busy ? status.data?.running && status.data.message ? status.data.message : "Starting…" : "The model couldn’t sort these the first time — often because Ollama was busy. Nothing is lost."}</span>
+    </div>
+    <Button variant="outline" size="sm" onClick={retry} disabled={busy}>{busy ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}{busy ? "Retrying…" : "Try classification again"}</Button>
+  </div>
 }
 
 export default function TriagePage({ bootstrap }: { bootstrap: Bootstrap }) {
@@ -124,22 +159,18 @@ export default function TriagePage({ bootstrap }: { bootstrap: Bootstrap }) {
     } else if (event.key.toLowerCase() === "e" && selectedMessage && !done.isPending) setDone(selectedMessage)
   }, [messages, selected, selectedMessage, done.isPending, selectMessage])
 
-  const retryAll = async () => {
-    try { await api.post("/api/reclassify", {}); toast("Classification retry started.", "success"); queryClient.invalidateQueries({ queryKey: ["status"] }) }
-    catch (error) { toast(error instanceof Error ? error.message : "Could not start retry.", "error") }
-  }
-
   if (query.isPending) return <div className="page-wrap"><Loading /></div>
-  if (query.error && !data) return <div className="page-wrap"><div className="inline-error">Could not load triage. {query.error.message}</div></div>
+  if (query.error && !data) return <div className="page-wrap"><div className="inline-error">Could not load triage. {query.error.message}<Button variant="outline" size="sm" onClick={() => void query.refetch()}><RefreshCw size={14} />Try again</Button></div></div>
   const waitingSetup = !bootstrap.readiness.model || !bootstrap.readiness.accounts
   const noMessages = !messages.length
+  const activeFilters = (normalized.has("account") ? 1 : 0) + (normalized.has("category") ? 1 : 0) + (normalized.get("days") !== "30" ? 1 : 0)
   const unclassifiedCount = data?.counts.unclassified ?? 0
   return <div className="page-wrap triage-page" onKeyDown={actKey}>
-    <PageHeading eyebrow={view === "queue" ? "YOUR NEXT MOVE" : view === "all" ? "THE FULL PICTURE" : "A JOB WELL DONE"} title={title || "Your triage"} description={data?.last_run || bootstrap.last_run || undefined} action={<Button variant="ghost" size="sm" onClick={undo} title="Undo the most recent Done action"><RotateCcw size={15} />Undo <kbd>⌘Z</kbd></Button>} />
+    <PageHeading eyebrow={view === "queue" ? "YOUR NEXT MOVE" : view === "all" ? "THE FULL PICTURE" : "A JOB WELL DONE"} title={title || "Your triage"} description={data?.last_run || bootstrap.last_run || undefined} action={<Button variant="ghost" size="sm" onClick={undo} title="Undo the most recent Done action"><RotateCcw size={15} />Undo <kbd>{modKey}+Z</kbd></Button>} />
+    {(view === "queue" || view === "all") && unclassifiedCount > 0 && bootstrap.readiness.model && <ReclassifyBanner count={unclassifiedCount} />}
     <div className="triage-bar"><div className="view-tabs" role="tablist" aria-label="Mail views">{(["queue", "all", "completed"] as const).map((key) => <button type="button" role="tab" aria-selected={view === key} className={view === key ? "selected" : ""} key={key} onClick={() => setFilter("view", key)}>{key === "queue" ? "Queue" : key === "all" ? "All mail" : "Completed"}{key === "queue" && data?.summary.actionable ? <span className="tab-count">{data.summary.actionable}</span> : null}</button>)}</div>
-      <div className="triage-tools"><Button variant="outline" size="sm" className={filtersOpen ? "tool-active" : ""} onClick={() => setFiltersOpen((current) => !current)}><Filter size={14} />Filters<ChevronDown size={13} /></Button><span className="list-count">{data?.total.toLocaleString()} messages</span></div></div>
+      <div className="triage-tools"><Button variant="outline" size="sm" className={filtersOpen ? "tool-active" : ""} onClick={() => setFiltersOpen((current) => !current)}><Filter size={14} />Filters{activeFilters > 0 && <span className="tab-count" aria-label={`${activeFilters} active`}>{activeFilters}</span>}<ChevronDown size={13} /></Button><span className="list-count">{data?.total.toLocaleString()} messages</span></div></div>
     {filtersOpen && <div className="filter-panel"><label>Mailbox<select value={normalized.get("account") || ""} onChange={(e) => setFilter("account", e.target.value)}><option value="">All mailboxes</option>{data?.accounts.map((account) => <option key={account.label} value={account.label}>{account.label}</option>)}</select></label><label>Category<select value={normalized.get("category") || ""} onChange={(e) => setFilter("category", e.target.value)}><option value="">All categories</option>{bootstrap.taxonomy.filter((category) => data?.counts[category.name]).map((category) => <option key={category.name} value={category.name}>{category.label} · {data?.counts[category.name]}</option>)}</select></label><label>Time range<select value={normalized.get("days") || "30"} onChange={(e) => setFilter("days", e.target.value)}>{[2, 3, 7, 14, 30, 90].map((days) => <option key={days} value={days}>Last {days} days</option>)}</select></label>{(normalized.has("account") || normalized.has("category") || normalized.get("days") !== "30") && <Button variant="ghost" size="sm" onClick={() => { const next = new URLSearchParams("view=" + view); history.pushState(null, "", `/?${next}`); setParams(next) }}>Clear filters</Button>}</div>}
-    {view === "queue" && unclassifiedCount > 0 && bootstrap.readiness.model && <div className="attention-banner"><span><Sparkles size={15} />{unclassifiedCount} message{unclassifiedCount === 1 ? "" : "s"} need a closer look</span><Button variant="outline" size="sm" onClick={retryAll}><RefreshCw size={14} />Try classification again</Button></div>}
     {waitingSetup && noMessages ? <EmptyState title="A thoughtful inbox starts here" description={!bootstrap.readiness.model ? "Connect your Ollama model in Settings. It runs where you choose, and your mailbox remains read-only." : "Connect a mail account to start building your private application inbox."} action={<Button onClick={() => window.location.assign(!bootstrap.readiness.model ? "/settings" : "/accounts")}>Continue setup</Button>} /> : noMessages ? <EmptyState title={view === "completed" ? "No completed messages yet" : view === "queue" ? "Your queue is clear" : "No mail in this range"} description={view === "queue" ? "Nothing needs your attention right now. Your mail is still right where you left it." : "Try another date range or clear a filter to see more messages."} action={view === "queue" && data?.summary.informational ? <Button variant="outline" onClick={() => setFilter("view", "all")}>Take a look at all mail</Button> : undefined} /> : <div className={`triage-split ${readerOpen ? "reader-is-open" : ""}`}>
       <div className="message-list" ref={listRef} role="listbox" aria-label="Triage messages" tabIndex={-1}>{data?.groups.map((group) => <section key={group.tier} className="tier-section"><div className={`tier-label tier-${group.tier}`}><span className="tier-dot" /><span>{group.label}</span><span className="tier-rule" /><span className="tier-total">{group.items.length}</span></div>{group.items.map((message) => <button role="option" aria-selected={selected === message.pk} tabIndex={selected === message.pk ? 0 : -1} key={message.pk} data-pk={message.pk} className={`mail-row ${selected === message.pk ? "mail-selected" : ""} ${message.handled_at ? "mail-done" : ""}`} onClick={() => selectMessage(message.pk)} onDoubleClick={() => setDone(message)}>
         <span className="mail-row-top"><CategoryBadge message={message} />{message.deadline_display && <span className={`row-deadline ${/overdue|today/i.test(message.deadline_display) ? "deadline-urgent" : ""}`}><Clock3 size={12} />{message.deadline_display}</span>}<span className="row-date">{message.date_display}</span></span>
@@ -147,6 +178,6 @@ export default function TriagePage({ bootstrap }: { bootstrap: Bootstrap }) {
       </button>)}</section>)}</div>
       <Reader message={selectedMessage} mobile={readerOpen} readerRef={readerRef} onBack={() => { setReaderOpen(false); focusSelection(selectedMessage?.pk ?? null, false) }} onDone={() => selectedMessage && setDone(selectedMessage)} busy={done.isPending} canRetry={bootstrap.readiness.model} />
     </div>}
-    <div className="keyboard-note"><span><kbd>↑</kbd><kbd>↓</kbd> navigate</span><span><kbd>E</kbd> done</span><span><kbd>⌘</kbd><kbd>Z</kbd> undo</span></div>
+    <div className="keyboard-note"><span><kbd>↑</kbd><kbd>↓</kbd> navigate</span><span><kbd>E</kbd> done</span><span><kbd>{modKey}</kbd><kbd>Z</kbd> undo</span></div>
   </div>
 }

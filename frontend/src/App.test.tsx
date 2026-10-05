@@ -78,3 +78,71 @@ describe("header status after external text replacement", () => {
     expect(console.error).not.toHaveBeenCalled()
   })
 })
+
+describe("live countdown", () => {
+  // Fake only the interval and the clock: react-query, waitFor and the status
+  // poll all rely on real setTimeout.
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] }) })
+  afterEach(() => { vi.useRealTimers() })
+
+  const mount = () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    clients.push(client)
+    return render(<QueryClientProvider client={client}><MemoryRouter><App /></MemoryRouter></QueryClientProvider>)
+  }
+  const digits = (container: HTMLElement) => container.querySelector(".connection-status strong")?.textContent ?? null
+
+  it("counts down every second without asking the server again", async () => {
+    const status = vi.spyOn(api, "status").mockResolvedValue({ ...scheduled, next_in: 120 })
+    const { container } = mount()
+    await waitFor(() => expect(digits(container)).toBe("2:00"))
+    const calls = status.mock.calls.length
+
+    await act(async () => { vi.advanceTimersByTime(5000) })
+
+    expect(digits(container)).toBe("1:55")
+    expect(status.mock.calls.length).toBe(calls)
+  })
+
+  it("re-baselines on the server's value after a poll", async () => {
+    let current: Status = { ...scheduled, next_in: 120 }
+    vi.spyOn(api, "status").mockImplementation(async () => current)
+    const { container } = mount()
+    await waitFor(() => expect(digits(container)).toBe("2:00"))
+    await act(async () => { vi.advanceTimersByTime(5000) })
+
+    current = { ...scheduled, next_in: 200 }
+    await act(async () => { fireEvent.focus(window) })
+
+    expect(digits(container)).toBe("3:20")
+  })
+
+  it("polls right away at zero and switches to the running message", async () => {
+    let current: Status = { ...scheduled, next_in: 3 }
+    const status = vi.spyOn(api, "status").mockImplementation(async () => current)
+    const { container } = mount()
+    await waitFor(() => expect(digits(container)).toBe("0:03"))
+    const calls = status.mock.calls.length
+
+    current = { ...running, message: "Reading mail…" }
+    await act(async () => { vi.advanceTimersByTime(3000) })
+
+    await waitFor(() => expect(container.querySelector(".connection-status")?.textContent).toContain("Reading mail…"))
+    expect(status.mock.calls.length).toBeGreaterThan(calls)
+  })
+
+  it("keeps the ticking digits out of the live region", async () => {
+    vi.spyOn(api, "status").mockResolvedValue({ ...scheduled, next_in: 60 })
+    const { container } = mount()
+    await waitFor(() => expect(digits(container)).toBe("1:00"))
+    expect(container.querySelector(".connection-status")?.getAttribute("aria-live")).toBeNull()
+    expect(container.querySelector(".connection-status strong")?.closest("[aria-live=polite]")).toBeNull()
+  })
+
+  it("shows the schedule as a pressed toggle", async () => {
+    vi.spyOn(api, "status").mockResolvedValue({ ...scheduled, interval_minutes: 10 })
+    mount()
+    const toggle = await screen.findByRole("button", { name: "Auto-check on" })
+    expect(toggle.getAttribute("aria-pressed")).toBe("true")
+  })
+})

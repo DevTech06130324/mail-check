@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { Activity, BarChart3, ChevronRight, CircleHelp, Inbox, LoaderCircle, MailCheck, Moon, PanelLeftClose, PanelLeftOpen, Plus, Settings2, Sun, UsersRound } from "lucide-react"
@@ -42,11 +42,48 @@ function ThemeControl() {
   return <Button variant="ghost" size="icon" aria-label={`Color theme: ${theme}. Change theme`} title={`Theme: ${theme}`} onClick={rotate}><Icon size={18} /></Button>
 }
 
+const formatClock = (seconds: number) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`
+
+/** Counts down from the server's `next_in` between polls.
+ *
+ * The status poll only runs every 30 s while idle, so rendering `next_in`
+ * directly froze the clock between polls. This ticks locally off `Date.now()`
+ * (accurate even when a background tab throttles timers) and re-baselines on
+ * every poll, so the server stays the source of truth. Kept as its own
+ * component so only these digits re-render each second.
+ */
+function Countdown({ nextIn, receivedAt, onDue }: { nextIn: number; receivedAt: number; onDue: () => void }) {
+  const [now, setNow] = useState(() => Date.now())
+  const announced = useRef(false)
+  useEffect(() => {
+    announced.current = false
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [receivedAt, nextIn])
+  const remaining = Math.max(0, nextIn - Math.floor((now - receivedAt) / 1000))
+  useEffect(() => {
+    if (remaining === 0 && !announced.current) { announced.current = true; onDue() }
+  }, [remaining, onDue])
+  return <strong className="tabular" aria-live="off">{formatClock(remaining)}</strong>
+}
+
 function JobStatus({ bootstrap }: { bootstrap: Bootstrap }) {
   const queryClient = useQueryClient()
   const toast = useToast()
-  const [status, setStatus] = useState<{ running: boolean; completion_id: number; auto: boolean; next_in: number | null; message: string; detail: string; ok: boolean; stage_elapsed: number | null } | null>(null)
+  const [status, setStatusValue] = useState<Awaited<ReturnType<typeof api.status>> | null>(null)
+  const [receivedAt, setReceivedAt] = useState(() => Date.now())
+  const setStatus = useCallback((next: Awaited<ReturnType<typeof api.status>>) => { setStatusValue(next); setReceivedAt(Date.now()) }, [])
   const seen = useRef<number | null>(null)
+  const fastPollUntil = useRef(0)
+  const pollNow = useRef<() => void>(() => undefined)
+  // When the countdown reaches zero the server is about to start a check:
+  // poll quickly for a few seconds instead of waiting out the idle interval.
+  const onDue = useCallback(() => {
+    if (Date.now() < fastPollUntil.current) return // the fast loop is already polling
+    fastPollUntil.current = Date.now() + 10_000
+    pollNow.current()
+  }, [])
   useEffect(() => {
     let stopped = false
     let timer = 0
@@ -81,13 +118,14 @@ function JobStatus({ bootstrap }: { bootstrap: Bootstrap }) {
           } catch { /* Notification permissions and browser settings are optional. */ }
         }
       } catch { /* Local console may be starting; retry on the normal cadence. */ }
-      if (!stopped) timer = window.setTimeout(poll, status?.running ? 1000 : 30000)
+      if (!stopped) timer = window.setTimeout(poll, status?.running ? 1000 : Date.now() < fastPollUntil.current ? 2000 : 30000)
     }
     const focus = () => { window.clearTimeout(timer); void poll() }
+    pollNow.current = focus
     void poll()
     window.addEventListener("focus", focus)
     return () => { stopped = true; window.clearTimeout(timer); window.removeEventListener("focus", focus) }
-  }, [queryClient, toast, status?.running])
+  }, [queryClient, toast, setStatus, status?.running])
 
   const runCheck = async () => {
     try {
@@ -97,24 +135,27 @@ function JobStatus({ bootstrap }: { bootstrap: Bootstrap }) {
     } catch (error) { toast(error instanceof Error ? error.message : "Could not start the check.", "error") }
   }
   const toggle = async () => {
+    const enable = !status?.auto
     try {
-      const fresh = await api.status(); setStatus(fresh)
-      await api.post(`/api/autocheck?enabled=${fresh.auto ? "false" : "true"}`)
-      const updated = await api.status(); setStatus(updated)
-      toast(updated.auto ? "Automatic checks are on." : "Automatic checks are off.", "success")
+      const result = await api.post<{ message?: string }>(`/api/autocheck?enabled=${enable}`)
+      setStatus(await api.status())
+      toast(result.message || (enable ? "Automatic checks are on." : "Automatic checks are off."), "success")
     } catch (error) { toast(error instanceof Error ? error.message : "Could not update the schedule.", "error") }
   }
-  const countdown = status?.auto && status.next_in != null
-    ? `${Math.floor(status.next_in / 60)}:${String(status.next_in % 60).padStart(2, "0")}` : null
+  const scheduled = Boolean(status?.auto && status.next_in != null)
+  const elapsed = status?.running && status.stage_elapsed != null && status.stage_elapsed >= 5 ? status.stage_elapsed : null
   return <div className="top-actions">
-    <span className={`connection-status ${status?.running ? "is-running" : ""}`} aria-live="polite">
+    <span className={`connection-status ${status?.running ? "is-running" : ""}`}>
       {status?.running ? <LoaderCircle className="spin" size={15} /> : <span className="status-dot" />}
       {/* Keep changing text in its own element: translators may replace text
-          nodes, so removing a bare text sibling can crash React reconciliation. */}
-      <span>{status?.running ? status.message || "Checking mail…" : countdown ? "Next check" : "All systems ready"}</span>
-      {!status?.running && countdown && <strong className="tabular">{countdown}</strong>}
+          nodes, so removing a bare text sibling can crash React reconciliation.
+          Only this message is a live region; the ticking digits are not, or a
+          screen reader would announce every second. */}
+      <span className="status-text" aria-live="polite">{status?.running ? status.message || "Checking mail…" : scheduled ? "Next check" : "All systems ready"}</span>
+      {elapsed != null && <small className="tabular status-elapsed">{elapsed}s</small>}
+      {!status?.running && scheduled && status?.next_in != null && <Countdown nextIn={status.next_in} receivedAt={receivedAt} onDue={onDue} />}
     </span>
-    <button className="schedule-button" type="button" onClick={toggle} title="Toggle automatic checks">{status?.auto ? "Pause schedule" : "Schedule"}</button>
+    <button className={`schedule-button ${status?.auto ? "is-on" : ""}`} type="button" aria-pressed={Boolean(status?.auto)} aria-label={status?.auto ? "Auto-check on" : "Auto-check off"} onClick={toggle} title={status?.auto ? `Checking automatically every ${status.interval_minutes ?? "?"} min. Click to turn off.` : "Turn on automatic checks"}><span className="sched-long">{status?.auto ? "Auto-check on" : "Auto-check off"}</span><span className="sched-short">{status?.auto ? "Auto on" : "Auto off"}</span></button>
     <Button onClick={runCheck} disabled={status?.running || !bootstrap.readiness.model || !bootstrap.readiness.accounts}>{status?.running ? <LoaderCircle className="spin" /> : <Plus />}<span>{status?.running ? "Checking" : "Check now"}</span></Button>
   </div>
 }
@@ -125,6 +166,8 @@ function Workspace({ bootstrap }: { bootstrap: Bootstrap }) {
   const location = useLocation()
   const navigate = useNavigate()
   useEffect(() => { setMobileNav(false) }, [location.pathname])
+  // The queue size in the tab title is visible from other tabs and the taskbar.
+  useEffect(() => { document.title = bootstrap.counts.actionable > 0 ? `(${bootstrap.counts.actionable}) mail-check` : "mail-check" }, [bootstrap.counts.actionable])
   const toggleSidebar = () => { const next = !collapsed; setCollapsed(next); localStorage.setItem("mailcheck.sidebar", next ? "collapsed" : "expanded") }
 
   return <div className={`app-frame ${collapsed ? "sidebar-collapsed" : ""}`}>
