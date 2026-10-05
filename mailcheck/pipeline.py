@@ -161,6 +161,7 @@ def check_once(
                 progress=progress,
                 classification_deadline_seconds=cfg.llm.classification_deadline_seconds,
                 event=on_event,
+                prepare=getattr(client, "prepare", None),
             )
         result.classification_seconds = time.monotonic() - classify_started
         result.errors.extend(errors)
@@ -226,10 +227,14 @@ def reclassify(
     only existing escape was ``--no-cache``, which re-bills every message in the
     window to rescue a handful. This retries exactly the ones that failed.
 
-    Batches of one, deliberately: a batch reply that dropped or garbled an item
-    is the usual cause, and re-sending the same batch shape tends to reproduce
-    it. Single-message requests also take the stricter second-pass prompt in
-    ``classify`` when the first attempt still will not parse.
+    Mail that failed because Ollama was busy or unreachable (``retryable``) goes
+    back in normal batches: nothing was wrong with it, and one request per
+    message would make a large backlog take five times as many round trips.
+    Everything else goes one per request, deliberately: a batch reply that
+    dropped or garbled an item is the usual cause, and re-sending the same batch
+    shape tends to reproduce it. Single-message requests also take the stricter
+    second-pass prompt in ``classify`` when the first attempt still will not
+    parse.
     """
     result = RunResult(started_at=datetime.now(timezone.utc))
     run_id = db.start_run(conn)
@@ -258,6 +263,7 @@ def reclassify(
     # A rule the user added since the original run beats another paid call.
     pending: list[NormalizedMessage] = []
     pending_pks: list[int] = []
+    solo: list[int] = []
     for row in rows:
         msg = _row_to_normalized(row)
         rule_hit = prefilter.apply(msg, cfg.prefilter_rules)
@@ -268,6 +274,8 @@ def reclassify(
             result.items.append(TriagedMessage(msg, rule_hit))
             result.prefiltered += 1
             continue
+        if not row["retryable"]:
+            solo.append(len(pending))
         pending.append(msg)
         pending_pks.append(row["pk"])
     conn.commit()
@@ -280,11 +288,13 @@ def reclassify(
             results, errors = classify(
                 client,
                 pending,
-                batch_size=1,
+                batch_size=cfg.llm.batch_size,
                 concurrency=cfg.llm.concurrency,
                 progress=progress,
                 classification_deadline_seconds=cfg.llm.classification_deadline_seconds,
                 event=on_event,
+                prepare=getattr(client, "prepare", None),
+                solo=solo,
             )
         result.classification_seconds = time.monotonic() - classify_started
         result.errors.extend(errors)

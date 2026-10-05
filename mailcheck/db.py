@@ -757,7 +757,8 @@ def messages_in_categories(
         """
         SELECT m.id AS pk, m.account_id, m.message_id, m.uid, m.folder,
                m.from_addr, m.from_name, m.subject, m.date_utc, m.body_text,
-               m.provider_url, a.label AS account_label
+               m.provider_url, a.label AS account_label,
+               c.retryable AS retryable
         FROM messages m
         JOIN accounts a ON a.id = m.account_id
         """

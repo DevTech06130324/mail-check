@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Collection
 
 from ..models import Classification, NormalizedMessage
 from ..taxonomy import UNCLASSIFIED
@@ -174,16 +174,34 @@ def _classify_batch(client: LLMClient, batch: list[tuple[str, NormalizedMessage]
 def classify(client: LLMClient, messages: list[NormalizedMessage], *, batch_size: int = 5,
              concurrency: int = 1, progress: ProgressFn | None = None,
              classification_deadline_seconds: int = 300,
-             event: EventFn | None = None) -> tuple[list[Classification], list[str]]:
-    """Classify in order; defer unresolved mail when Ollama becomes busy."""
+             event: EventFn | None = None,
+             prepare: Callable[..., None] | None = None,
+             solo: Collection[int] = ()) -> tuple[list[Classification], list[str]]:
+    """Classify in order; defer unresolved mail when Ollama becomes busy.
+
+    ``prepare`` runs once before the deadline starts, so a slow model load is
+    not charged against the time budget for the classification itself.
+    ``solo`` lists message indexes to send one per request regardless of
+    ``batch_size`` — for mail whose batch reply came back unusable.
+    """
     if not messages:
         return [], []
     # Concurrency is accepted for compatibility, but Ollama access is
     # intentionally serial to avoid queue and VRAM contention.
     _ = concurrency
+    if prepare:
+        try:
+            prepare(on_loading=(lambda: event({"type": "model_loading"})) if event else None)
+        except OllamaBusy as exc:
+            return ([_unclassified("Ollama busy; retry next check", retryable=True)
+                     for _ in messages],
+                    [f"{exc}. All of this mail will retry next check."])
     width = max(1, batch_size)
-    batches = [[(str(start + offset), msg) for offset, msg in enumerate(messages[start:start + width])]
-               for start in range(0, len(messages), width)]
+    solo_set = set(solo)
+    grouped = [i for i in range(len(messages)) if i not in solo_set]
+    groups = [grouped[start:start + width] for start in range(0, len(grouped), width)]
+    groups += [[i] for i in sorted(solo_set) if 0 <= i < len(messages)]
+    batches = [[(str(i), messages[i]) for i in group] for group in groups]
     deadline = time.monotonic() + min(300, max(0.001, classification_deadline_seconds))
     errors: list[str] = []
     merged: dict[str, Classification] = {}

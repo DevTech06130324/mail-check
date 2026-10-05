@@ -6,6 +6,7 @@ import json
 import random
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import httpx
 
@@ -49,14 +50,14 @@ class Completion(str):
         return obj
 
 
-def _endpoint(base_url: str) -> str:
+def _root(base_url: str) -> str:
     try:
         base = ollama_root(base_url)
     except ValueError as exc:
         raise LLMError(str(exc), category="configuration") from exc
     if not base:
         raise LLMError("No Ollama base_url configured. Run: mail-check init", category="configuration")
-    return f"{base}/api/chat"
+    return base
 
 
 class LLMClient:
@@ -64,12 +65,15 @@ class LLMClient:
                  timeout_seconds: int | None = None, max_retries: int = 2,
                  temperature: float = 0.0, use_json_mode: bool = True,
                  num_ctx: int = 8192, think: bool = False, keep_alive: str = "5m",
+                 load_timeout_seconds: float = 180.0,
                  transport: httpx.BaseTransport | None = None) -> None:
         if not base_url:
             raise LLMError("No base_url configured. Run: mail-check init", category="configuration")
         if not model:
             raise LLMError("No model configured. Run: mail-check init", category="configuration")
-        self.url = _endpoint(base_url)
+        root = _root(base_url)
+        self.url = f"{root}/api/chat"
+        self.ps_url = f"{root}/api/ps"
         self.model = model
         # This value is attempts, despite the historic name. Never allow more
         # than one retry: more requests amplify an already-busy Ollama queue.
@@ -79,6 +83,7 @@ class LLMClient:
         self.num_ctx = num_ctx
         self.think = think
         self.keep_alive = keep_alive
+        self.load_timeout_seconds = load_timeout_seconds
         self.timeout_seconds = min(
             60.0,
             float(timeout_seconds if timeout_seconds is not None else (timeout or 60)),
@@ -100,6 +105,67 @@ class LLMClient:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    def prepare(self, *, on_loading: Callable[[], None] | None = None) -> None:
+        """Make the requests that follow hit a model that is already resident.
+
+        Ollama reloads a model whenever a request asks for a different context
+        size than the one it is loaded with, and a large model can take minutes
+        to come back — far longer than the per-request timeout, which then
+        reads the wait as "Ollama busy". The usual trigger is another client
+        sharing the server with a different ``num_ctx``, which makes the two
+        evict each other on every request.
+
+        So: if the model is loaded with at least the context asked for, adopt
+        that context and send nothing that would reload it. If it is not loaded
+        at a usable size, load it once here with the longer load timeout so the
+        classification requests only ever see a warm model. If the server
+        cannot say what is loaded, do nothing and behave as before.
+        """
+        loaded = self._loaded_context()
+        if loaded is None:
+            return
+        if loaded >= self.num_ctx:
+            self.num_ctx = loaded
+            return
+        if on_loading:
+            on_loading()
+        self._load()
+
+    def _loaded_context(self) -> int | None:
+        """Context length the model is loaded with; 0 when not loaded, None when unknown."""
+        try:
+            resp = self._client.get(self.ps_url, timeout=10)
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return None
+        names = {self.model}
+        if ":" not in self.model:
+            names.add(f"{self.model}:latest")
+        for entry in models if isinstance(models, list) else []:
+            if isinstance(entry, dict) and names & {entry.get("name"), entry.get("model")}:
+                ctx = entry.get("context_length")
+                return int(ctx) if isinstance(ctx, (int, float)) else 0
+        return 0
+
+    def _load(self) -> None:
+        """Load the model with an empty chat request, which generates nothing."""
+        started = time.monotonic()
+        payload = {"model": self.model, "messages": [], "stream": False,
+                   "keep_alive": self.keep_alive, "options": {"num_ctx": self.num_ctx}}
+        try:
+            self._client.post(self.url, json=payload,
+                              timeout=self.load_timeout_seconds).raise_for_status()
+        except httpx.ReadTimeout as exc:
+            raise OllamaBusy(
+                "Ollama is still loading the model; try again in a minute",
+                category="timeout", attempts=1,
+                wall_seconds=time.monotonic() - started) from exc
+        except httpx.HTTPError:
+            # Leave the diagnosis to the real request, which reports 404s,
+            # refused connections and the rest with their proper category.
+            return
 
     def complete(self, system: str, user: str, *, json_mode: bool | None = None,
                  max_tokens: int = 2048, deadline: float | None = None) -> Completion:

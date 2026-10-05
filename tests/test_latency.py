@@ -300,5 +300,217 @@ class PersistenceAndDiagnosticsTests(unittest.TestCase):
                 json.loads(line)
 
 
+
+def _ps(models):
+    return httpx.Response(200, json={"models": models})
+
+
+_LOADED = {"name": "qwen3.5:35b-a3b", "model": "qwen3.5:35b-a3b", "context_length": 32768}
+
+
+class ModelPreparationTests(unittest.TestCase):
+    """A shared server reloads the model whenever a client asks for another
+    context size; a large model takes minutes to come back, far longer than the
+    per-request timeout. ``prepare`` must avoid that or absorb it."""
+
+    def _client(self, handler, **kwargs) -> LLMClient:
+        return LLMClient(base_url="http://ollama.test:11434", model="qwen3.5:35b-a3b",
+                         timeout_seconds=60, num_ctx=16384,
+                         transport=httpx.MockTransport(handler), **kwargs)
+
+    def test_adopts_a_larger_loaded_context_instead_of_forcing_a_reload(self) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request):
+            seen.append(request)
+            return _ps([_LOADED])
+
+        with self._client(handler) as client:
+            client.prepare()
+        self.assertEqual(client.num_ctx, 32768)
+        self.assertEqual([r.url.path for r in seen], ["/api/ps"])
+
+    def test_requests_use_the_adopted_context(self) -> None:
+        bodies: list[dict] = []
+
+        def handler(request):
+            if request.url.path == "/api/ps":
+                return _ps([_LOADED])
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"message": {"content": "{}"}, "done": True})
+
+        with self._client(handler) as client:
+            client.prepare()
+            client.complete("s", "u")
+        self.assertEqual(bodies[0]["options"]["num_ctx"], 32768)
+
+    def test_loads_once_with_a_long_timeout_when_not_resident(self) -> None:
+        seen: list[httpx.Request] = []
+        loading: list[bool] = []
+
+        def handler(request):
+            seen.append(request)
+            if request.url.path == "/api/ps":
+                return _ps([])
+            return httpx.Response(200, json={"done": True, "done_reason": "load"})
+
+        with self._client(handler) as client:
+            client.prepare(on_loading=lambda: loading.append(True))
+        load = seen[1]
+        body = json.loads(load.content)
+        self.assertEqual(load.url.path, "/api/chat")
+        self.assertEqual(body["messages"], [])
+        self.assertEqual(body["options"], {"num_ctx": 16384})
+        self.assertEqual(load.extensions["timeout"]["read"], 180.0)
+        self.assertEqual(client.num_ctx, 16384)
+        self.assertEqual(loading, [True])
+
+    def test_reloads_when_resident_with_a_smaller_context(self) -> None:
+        paths: list[str] = []
+
+        def handler(request):
+            paths.append(request.url.path)
+            if request.url.path == "/api/ps":
+                return _ps([{**_LOADED, "context_length": 8192}])
+            return httpx.Response(200, json={"done": True})
+
+        with self._client(handler) as client:
+            client.prepare()
+        self.assertEqual(paths, ["/api/ps", "/api/chat"])
+
+    def test_unknown_server_state_changes_nothing(self) -> None:
+        paths: list[str] = []
+
+        def handler(request):
+            paths.append(request.url.path)
+            return httpx.Response(404, json={"error": "no such endpoint"})
+
+        with self._client(handler) as client:
+            client.prepare()
+        self.assertEqual(paths, ["/api/ps"])
+        self.assertEqual(client.num_ctx, 16384)
+
+    def test_load_timeout_is_busy_not_a_crash(self) -> None:
+        def handler(request):
+            if request.url.path == "/api/ps":
+                return _ps([])
+            raise httpx.ReadTimeout("still loading", request=request)
+
+        with self._client(handler) as client:
+            with self.assertRaises(OllamaBusy) as raised:
+                client.prepare()
+        self.assertEqual(raised.exception.category, "timeout")
+
+    def test_classify_defers_everything_without_requests_when_load_fails(self) -> None:
+        class Client:
+            calls = 0
+
+            def prepare(self, **_kwargs):
+                raise OllamaBusy("still loading", category="timeout")
+
+            def complete(self, *_args, **_kwargs):
+                self.calls += 1
+
+        client = Client()
+        results, errors = classify(client, [_message(i) for i in range(3)],
+                                   prepare=client.prepare)
+        self.assertEqual(client.calls, 0)
+        self.assertTrue(all(r.retryable and r.category == "unclassified" for r in results))
+        self.assertEqual(len(errors), 1)
+
+    def test_classify_reports_loading_through_the_event_hook(self) -> None:
+        events: list[dict] = []
+
+        class Client:
+            def prepare(self, *, on_loading=None):
+                on_loading()
+
+            def complete(self, *_args, **_kwargs):
+                return Completion('{"results": []}', "stop")
+
+        client = Client()
+        classify(client, [_message(1)], prepare=client.prepare, event=events.append)
+        self.assertIn({"type": "model_loading"}, events)
+
+
+class _EchoClient:
+    """Answers every id it is sent, and records how many arrived per request."""
+
+    def __init__(self) -> None:
+        self.sizes: list[int] = []
+
+    def complete(self, _system, user, **_kwargs):
+        items = json.loads(user.split("\n", 1)[1])
+        self.sizes.append(len(items))
+        results = [{"id": item["id"], "category": "rejection"} for item in items]
+        return Completion(json.dumps({"results": results}), "stop")
+
+
+class SoloBatchingTests(unittest.TestCase):
+    def test_solo_messages_are_sent_alone_and_the_rest_batched(self) -> None:
+        client = _EchoClient()
+        results, _ = classify(client, [_message(i) for i in range(7)],
+                              batch_size=3, solo={1, 5})
+        self.assertEqual(client.sizes, [3, 2, 1, 1])
+        self.assertEqual(len(results), 7)
+        self.assertTrue(all(r.category == "rejection" for r in results))
+
+    def test_no_solo_keeps_plain_batching(self) -> None:
+        client = _EchoClient()
+        classify(client, [_message(i) for i in range(7)], batch_size=3)
+        self.assertEqual(client.sizes, [3, 3, 1])
+
+
+class ReclassifyBatchingTests(unittest.TestCase):
+    def test_busy_failures_are_batched_and_garbled_ones_go_alone(self) -> None:
+        from mailcheck import config as cfgmod
+        from mailcheck import pipeline
+
+        seen: list[dict] = []
+
+        def fake_classify(_client, messages, **kwargs):
+            seen.append({"batch_size": kwargs["batch_size"],
+                         "solo": [messages[i].subject for i in sorted(kwargs["solo"])]})
+            return [Classification(category="rejection", confidence=0.9, source="llm")
+                    for _ in messages], []
+
+        class Factory:
+            @staticmethod
+            def from_config(_cfg):
+                class Ctx:
+                    def __enter__(self):
+                        return object()
+
+                    def __exit__(self, *exc):
+                        return None
+
+                return Ctx()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = db.connect(Path(tmp) / "t.db")
+            db.add_account(conn, label="mail", email="me@x.com", imap_host="imap.x.com")
+            account_id = conn.execute("SELECT id FROM accounts").fetchone()[0]
+            for i, retryable in enumerate([True, False, True, False]):
+                msg = _message(i)
+                msg.account_id = account_id
+                pk = db.upsert_message(conn, msg)
+                db.save_classification(conn, pk, Classification(
+                    category="unclassified", action_required=True, retryable=retryable,
+                    summary="Could not classify automatically (test)."), "m", "1")
+            conn.commit()
+
+            cfg = cfgmod.Config.model_validate(
+                {"llm": {"base_url": "http://x", "model": "m", "batch_size": 4}})
+            with patch.object(pipeline, "LLMClient", Factory), \
+                 patch.object(pipeline, "classify", fake_classify):
+                result = pipeline.reclassify(conn, cfg)
+            conn.close()
+
+        self.assertEqual(result.classified, 4)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["batch_size"], 4)
+        self.assertEqual(sorted(seen[0]["solo"]), ["Subject 1", "Subject 3"])
+
+
 if __name__ == "__main__":
     unittest.main()

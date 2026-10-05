@@ -346,6 +346,9 @@ def _run_check(body: CheckBody) -> None:
                              f"{values.get('total', '?')} complete"),
                     stage_started=time.time(),
                 )
+            elif values.get("type") == "model_loading":
+                _job.update(message="Loading the model into memory — this can take a couple of minutes…",
+                            stage_started=time.time())
             elif values.get("type") == "llm_request" and values.get("outcome") in {
                 "timeout", "busy", "deadline"
             }:
@@ -395,10 +398,13 @@ def _run_reclassify(body: ReclassifyBody) -> None:
                              f"{values.get('total', '?')} complete"),
                     stage_started=time.time(),
                 )
+            elif values.get("type") == "model_loading":
+                _job.update(message="Loading the model into memory — this can take a couple of minutes…",
+                            stage_started=time.time())
             elif values.get("type") == "llm_request" and values.get("outcome") in {
                 "timeout", "busy", "deadline"
             }:
-                _job.update(message="Ollama busy; remaining mail will retry next check")
+                _job.update(message="Ollama busy; press Retry again to continue")
 
         with db.session() as conn:
             result = reclassify(
@@ -420,6 +426,8 @@ def _run_reclassify(body: ReclassifyBody) -> None:
         bits = [f"{result.classified + result.prefiltered} of {result.fetched} resolved"]
         if still:
             bits.append(f"{still} still unclassified")
+        if result.retryable:
+            bits.append("Ollama busy — press Retry again to continue")
         _job.update(
             message=" · ".join(bits),
             detail="\n".join(result.errors[:5]),
