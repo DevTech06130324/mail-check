@@ -77,7 +77,11 @@ async function pollStatus() {
     } catch (e) {
       break;
     }
-    if (status && s.message) status.textContent = s.message;
+    if (status && s.message) {
+      status.textContent = s.running && Number.isFinite(s.stage_elapsed)
+        ? `${s.message} · ${s.stage_elapsed}s`
+        : s.message;
+    }
     syncSchedule(s.auto, s.next_in);
     if (!s.running) {
       bar.hidden = true;
@@ -86,7 +90,10 @@ async function pollStatus() {
         // Announce before reloading, or the pending popups are lost with the page.
         await flushNotifications();
         toast(s.detail ? `${s.message}\n${s.detail}` : s.message, s.ok);
-        setTimeout(() => location.reload(), s.ok ? 700 : 2600);
+        const finish = new CustomEvent("mailcheck:job-finished", { detail: s, cancelable: true });
+        if (window.dispatchEvent(finish)) {
+          setTimeout(() => location.reload(), s.ok ? 700 : 2600);
+        }
       }
       break;
     }
@@ -385,6 +392,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (s.at && s.at !== lastAt) {
           lastAt = s.at;               // a run finished behind our back
           flushNotifications();
+          window.dispatchEvent(new CustomEvent("mailcheck:job-finished", { detail: s }));
         }
       })
       .catch(() => {});

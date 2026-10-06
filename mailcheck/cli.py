@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
+import tomllib
+import uuid
 
 import typer
 from rich.panel import Panel
@@ -30,10 +33,9 @@ app.add_typer(account_app, name="account")
 
 PRIVACY_NOTICE = (
     "mail-check sends the sender, subject and the first part of each email body to "
-    "the LLM endpoint you configure.\n\n"
-    "Job-application mail contains real names, phone numbers and salary discussion, "
-    "and free tiers on model routers commonly log — and sometimes train on — request "
-    "data.\n\n"
+    "the Ollama server you configure on your local network.\n\n"
+    "Email content leaves this computer for that server. Mailbox connections still "
+    "use your email provider.\n\n"
     "Your mail is never modified: mailboxes are opened read-only and nothing is ever "
     "marked as read."
 )
@@ -60,7 +62,7 @@ def _load_cfg() -> cfgmod.Config:
 
 
 def _require_llm(cfg: cfgmod.Config) -> None:
-    if not cfg.is_llm_ready() or not secrets.has_llm_token():
+    if not cfg.is_llm_ready():
         console.print("[red]LLM is not configured.[/red] Run: [bold]mail-check init[/bold]")
         raise typer.Exit(1)
 
@@ -70,13 +72,27 @@ def _require_llm(cfg: cfgmod.Config) -> None:
 
 @app.command()
 def init(
-    base_url: str = typer.Option(None, help="OmniRoute base URL, e.g. https://.../v1"),
+    base_url: str = typer.Option(None, help="Ollama server root, e.g. http://192.168.2.230:11440"),
     model: str = typer.Option(None, help="Model name."),
-    token: str = typer.Option(None, help="Auth token (prompted if omitted)."),
     test: bool = typer.Option(True, help="Send a test request after saving."),
 ) -> None:
-    """Configure the OmniRoute endpoint."""
-    cfg = _load_cfg()
+    """Configure the native Ollama endpoint."""
+    # Apply explicit migration arguments before validation: old /v1 configs
+    # cannot otherwise be loaded to replace their endpoint.
+    path = cfgmod.config_path()
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except FileNotFoundError:
+        data = {}
+    if base_url is not None:
+        data.setdefault("llm", {})["base_url"] = base_url
+    if model is not None:
+        data.setdefault("llm", {})["model"] = model
+    try:
+        cfg = cfgmod.Config.model_validate(data)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
     if not cfg.privacy_ack:
         console.print(Panel(PRIVACY_NOTICE, title="Before you start", border_style="yellow"))
@@ -85,16 +101,22 @@ def init(
         cfg.privacy_ack = True
 
     cfg.llm.base_url = base_url or Prompt.ask(
-        "OmniRoute base_url", default=cfg.llm.base_url or None
+        "Ollama server root", default=cfg.llm.base_url or None
     )
     cfg.llm.model = model or Prompt.ask("Model name", default=cfg.llm.model or None)
-    tok = token or Prompt.ask("Auth token", password=True)
-    if tok:
-        secrets.set_llm_token(tok)
+    # Revalidate values assigned after loading so init cannot save a /v1 URL.
+    try:
+        cfg = cfgmod.Config.model_validate(cfg.model_dump())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
+    if path.exists():
+        backup = path.with_name(f"config.toml.{uuid.uuid4().hex[:12]}.bak")
+        shutil.copy2(path, backup)
+        console.print(f"[dim]Previous configuration backed up to {backup}[/dim]")
     path = cfgmod.save(cfg)
     console.print(f"[green]Saved[/green] {path}")
-    console.print(f"[dim]Token stored in the OS keyring. Database: {cfgmod.db_path()}[/dim]")
+    console.print(f"[dim]Database: {cfgmod.db_path()}[/dim]")
 
     if test:
         _ping(cfg)
@@ -103,16 +125,10 @@ def init(
 def _ping(cfg: cfgmod.Config) -> None:
     console.print("Testing endpoint...")
     try:
-        with LLMClient(
-            base_url=cfg.llm.base_url,
-            token=secrets.get_llm_token(),
-            model=cfg.llm.model,
-            timeout=cfg.llm.timeout_seconds,
-            max_retries=2,
-        ) as client:
+        with LLMClient.from_config(cfg.llm) as client:
             reply = client.ping()
         console.print(f"[green]OK[/green] - model replied: [dim]{reply.strip()[:120]}[/dim]")
-    except (LLMError, secrets.SecretError) as exc:
+    except LLMError as exc:
         console.print(f"[red]Endpoint test failed:[/red] {exc}")
         console.print("[dim]Fix with: mail-check init, or mail-check config set llm.base_url ...[/dim]")
         raise typer.Exit(1)
@@ -420,14 +436,12 @@ def config_show() -> None:
     cfg = _load_cfg()
     console.print(f"[dim]{cfgmod.config_path()}[/dim]")
     console.print_json(cfg.model_dump_json(indent=2))
-    console.print(
-        f"[dim]auth token stored: {'yes' if secrets.has_llm_token() else 'no'}[/dim]"
-    )
+
 
 
 @config_app.command("set")
 def config_set(key: str, value: str) -> None:
-    """Set a dotted key, e.g. `config set llm.batch_size 4`."""
+    """Set a dotted key, e.g. `config set llm.batch_size 5`."""
     cfg = _load_cfg()
     try:
         cfg = cfgmod.set_dotted(cfg, key, value)
@@ -441,13 +455,6 @@ def config_set(key: str, value: str) -> None:
         raise typer.Exit(1)
     cfgmod.save(cfg)
     console.print(f"[green]Set[/green] {key} = {value}")
-
-
-@config_app.command("token")
-def config_token() -> None:
-    """Replace the stored auth token."""
-    secrets.set_llm_token(Prompt.ask("Auth token", password=True))
-    console.print("[green]Token updated.[/green]")
 
 
 @config_app.command("test")

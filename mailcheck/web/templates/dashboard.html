@@ -5,13 +5,71 @@
 {% set q = "&account=" ~ selected_account if selected_account else "" %}
 {% set q = q ~ ("&days=" ~ days if days != 30 else "") %}
 
-<div class="page-head">
+{# One band, not three stacked blocks. The headline, the view tabs, the filter
+   disclosure and the shortcut hint used to cost ~155px of vertical space
+   before a single email appeared; on a laptop that was a quarter of the window
+   spent on chrome. The mail is what the page is for, so the chrome gets one
+   row and the panes get the rest. #}
+<div class="page-head triage-head">
   <h1>
     {% if view == 'queue' %}
       {% if summary.actionable %}{{ summary.actionable }} to handle{% else %}All clear{% endif %}
     {% elif view == 'completed' %}Completed
     {% else %}All mail{% endif %}
   </h1>
+
+  <nav class="views" aria-label="Mail views">
+    <a href="/?view=queue{{ q }}" {% if view == 'queue' %}aria-current="page"{% endif %}>
+      Queue{% if summary.actionable %} <span class="count">{{ summary.actionable }}</span>{% endif %}
+    </a>
+    <a href="/?view=all{{ q }}" {% if view == 'all' %}aria-current="page"{% endif %}>
+      All mail{% if summary.informational or summary.actionable %} <span class="count">{{ summary.informational + summary.actionable }}</span>{% endif %}
+    </a>
+    <a href="/?view=completed{{ q }}" {% if view == 'completed' %}aria-current="page"{% endif %}>
+      Completed{% if summary.done %} <span class="count">{{ summary.done }}</span>{% endif %}
+    </a>
+  </nav>
+
+  {% if total %}
+  <p class="shortcuts">
+    <kbd>↑</kbd><kbd>↓</kbd> move · <kbd>E</kbd>
+    {%- if view == 'completed' %} restore{% else %} mark done{% endif %} ·
+    <kbd>Ctrl</kbd><kbd>Z</kbd> undo
+  </p>
+  {% endif %}
+
+  {# Open, it takes a line of its own rather than squeezing the row. #}
+  <details class="filters">
+    <summary>Filters{% if selected_account or selected_category or days != 30 %} · active{% endif %}</summary>
+    <form method="get" class="filter-row">
+      <input type="hidden" name="view" value="{{ view }}">
+      <select name="account" onchange="this.form.submit()" aria-label="Account">
+        <option value="">All accounts</option>
+        {% for a in accounts %}
+        <option value="{{ a.label }}" {% if a.label == selected_account %}selected{% endif %}>{{ a.label }}</option>
+        {% endfor %}
+      </select>
+      <select name="category" onchange="this.form.submit()" aria-label="Category">
+        <option value="">All categories</option>
+        {% for c in categories %}
+        <option value="{{ c.name }}" {% if c.name == selected_category %}selected{% endif %}>
+          {{ c.label }} ({{ counts.get(c.name, 0) }})
+        </option>
+        {% endfor %}
+      </select>
+      <select name="days" onchange="this.form.submit()" aria-label="Time range">
+        {% for d in [2, 3, 7, 14, 30, 90] %}
+        <option value="{{ d }}" {% if d == days %}selected{% endif %}>Last {{ d }} days</option>
+        {% endfor %}
+      </select>
+      {% if selected_account or selected_category or days != 30 %}
+      <a class="btn sm" href="/?view={{ view }}">Clear</a>
+      {% endif %}
+    </form>
+  </details>
+
+  {# Its own line, and small: it carries live progress during a check, so it
+     has to be here, but it is the least of what this row is for. #}
   <p id="status-line">
     {{ last_run }}{% if not auto_check %} · <a href="/settings">Turn on automatic checks</a>{% endif %}
   </p>
@@ -21,7 +79,7 @@
 <div class="banner warn">
   <div>
     <div class="b-title">Connect a model to start</div>
-    <div class="b-body">mail-check needs an OpenAI-compatible endpoint before it can classify anything.</div>
+    <div class="b-body">Set your Ollama server URL and model before classifying mail.</div>
   </div>
   <a class="btn primary sm" href="/settings">Open Settings</a>
 </div>
@@ -35,49 +93,15 @@
 </div>
 {% endif %}
 
-<nav class="views" aria-label="Mail views">
-  <a href="/?view=queue{{ q }}" {% if view == 'queue' %}aria-current="page"{% endif %}>
-    Queue{% if summary.actionable %} <span class="count">{{ summary.actionable }}</span>{% endif %}
-  </a>
-  <a href="/?view=all{{ q }}" {% if view == 'all' %}aria-current="page"{% endif %}>
-    All mail{% if summary.informational or summary.actionable %} <span class="count">{{ summary.informational + summary.actionable }}</span>{% endif %}
-  </a>
-  <a href="/?view=completed{{ q }}" {% if view == 'completed' %}aria-current="page"{% endif %}>
-    Completed{% if summary.done %} <span class="count">{{ summary.done }}</span>{% endif %}
-  </a>
-</nav>
-
-<details class="filters">
-  <summary>Filters{% if selected_account or selected_category or days != 30 %} · active{% endif %}</summary>
-  <form method="get" class="filter-row">
-    <input type="hidden" name="view" value="{{ view }}">
-    <select name="account" onchange="this.form.submit()" aria-label="Account">
-      <option value="">All accounts</option>
-      {% for a in accounts %}
-      <option value="{{ a.label }}" {% if a.label == selected_account %}selected{% endif %}>{{ a.label }}</option>
-      {% endfor %}
-    </select>
-    <select name="category" onchange="this.form.submit()" aria-label="Category">
-      <option value="">All categories</option>
-      {% for c in categories %}
-      <option value="{{ c.name }}" {% if c.name == selected_category %}selected{% endif %}>
-        {{ c.label }} ({{ counts.get(c.name, 0) }})
-      </option>
-      {% endfor %}
-    </select>
-    <select name="days" onchange="this.form.submit()" aria-label="Time range">
-      {% for d in [2, 3, 7, 14, 30, 90] %}
-      <option value="{{ d }}" {% if d == days %}selected{% endif %}>Last {{ d }} days</option>
-      {% endfor %}
-    </select>
-    {% if selected_account or selected_category or days != 30 %}
-    <a class="btn sm" href="/?view={{ view }}">Clear</a>
-    {% endif %}
-  </form>
-</details>
-
-<div id="queue">
 {% set shown = namespace(any=false) %}
+{# Exactly one row carries tabindex="0", so the list is a single tab stop that
+   the arrow keys then move within — rendered server-side rather than assigned
+   by script, so Tab reaches the list even before the page's JS has run. #}
+{% set row = namespace(first=true) %}
+<div class="split" {% if not total %}hidden{% endif %}>
+
+<!-- Left: the list. Scrolls on its own, so the reader beside it stays put. -->
+<div id="queue" class="mail-list">
 {% for tier in tier_order %}
   {% set items = groups.get(tier, []) %}
   {% if items %}
@@ -92,7 +116,7 @@
         <!-- Not on Completed: the count there is of finished items, but a bulk
              retry is scoped by category alone and would sweep up the live queue
              too — a button whose number does not describe what it does. The
-             per-card retry below stays available in every view. -->
+             per-message retry in the reader stays available in every view. -->
         {% if tier == 'unknown' and unclassified_count and llm_ready and view != 'completed' %}
         <!-- A failed classification is cached under the same key as a good one,
              so an ordinary check will never revisit it. This is the way back. -->
@@ -105,8 +129,14 @@
       </h2>
 
       {% for i in items %}
+      <!-- A row is a selection target and nothing else: one tab stop for the
+           whole list and then the arrow keys, rather than a tab stop per email
+           plus three more per card. Everything actionable lives in the reader,
+           which is one set of controls however long the list gets. -->
       <article class="mail{% if i.handled_at %} is-done{% endif %}" id="mail-{{ i.pk }}"
-               data-pk="{{ i.pk }}">
+               data-pk="{{ i.pk }}" data-tier="{{ tier }}"
+               tabindex="{{ 0 if row.first else -1 }}">
+        {% set row.first = false %}
         <div class="mail-top">
           <span class="chip">{{ i.category_label }}</span>
           {% if i.deadline_display %}
@@ -126,53 +156,31 @@
 
         <!-- Which mailbox it arrived in, sitting between the headline and the
              summary: it reads as part of "what is this", picked up on the way
-             from who it is about down to what they want. On the card face
-             rather than only behind Details, because with more than one
-             account connected "is this my personal or my work address?"
-             changes how you answer, and that is not worth a click per card. -->
+             from who it is about down to what they want. In the row rather
+             than only in the reader, because with more than one account
+             connected "is this my personal or my work address?" changes how
+             you answer, and that is not worth a keystroke per email. -->
         <span class="acct"><span class="sr-only">Account: </span>{{ i.account_label }}</span>
 
         <p class="summary">{{ i.summary or i.snippet }}</p>
 
-        <div class="actions">
-          {% if i.open_url %}
-          <a class="btn sm primary" href="{{ i.open_url }}" target="_blank" rel="noopener">
-            {{ i.open_label }}
-          </a>
-          {% endif %}
-          {% if i.category == 'unclassified' and llm_ready %}
-          <button class="btn sm" data-busy="Retrying…" onclick="reclassifyOne({{ i.pk }}, this)"
-                  title="Ask the model again about just this email">Classify again</button>
-          {% endif %}
-          {% if i.handled_at %}
-          <button class="btn sm" onclick="setDone({{ i.pk }}, false, this)">Restore</button>
-          {% else %}
-          <button class="btn sm" onclick="setDone({{ i.pk }}, true, this)">Done</button>
-          {% endif %}
-          <details class="detail">
-            <summary>Details</summary>
-            <div class="detail-body">
-              <div class="kv"><span>Subject</span><span>{{ i.subject }}</span></div>
-              <div class="kv"><span>From</span><span>{{ i.from_addr }}</span></div>
-              <div class="kv"><span>Account</span><span>{{ i.account_label }}</span></div>
-              {% if i.confidence and i.confidence < 0.5 %}
-              <div class="kv"><span>Confidence</span><span>Low ({{ (i.confidence * 100)|round|int }}%)</span></div>
-              {% endif %}
-              {% if i.source == 'prefilter' %}
-              <div class="kv"><span>Source</span><span>Local rule</span></div>
-              {% endif %}
-              <!-- Loaded on first open, not with the page: 500 full email
-                   bodies inline was most of this document's weight, for
-                   something read one at a time if at all. -->
-              <pre data-body="{{ i.pk }}">Loading…</pre>
-            </div>
-          </details>
-        </div>
       </article>
       {% endfor %}
     </section>
   {% endif %}
 {% endfor %}
+</div>
+
+<!-- Right: whatever is selected. Deliberately not a live region — replacing it
+     wholesale on every arrow press would read a full email body aloud each time.
+     Moving the selection focuses the row instead, which announces the one line
+     that changed; the reader is then there to be read at will. -->
+<section class="reader" id="reader" role="region" aria-label="Selected email">
+  <div class="reader-placeholder">
+    {% if shown.any %}Select an email to read it here.{% else %}Nothing to read yet.{% endif %}
+  </div>
+</section>
+
 </div>
 
 <div class="empty" id="empty-state" {% if shown.any %}hidden{% endif %}>
@@ -210,39 +218,289 @@
 
 {% block scripts %}
 <script>
-/* The card is removed and the badges are repainted from the counts the server
+/* ------------------------------------------------------------- selection */
+
+/* One email is selected at a time; the reader shows it. The list is a single
+   tab stop and the arrow keys move within it, which is the whole point of the
+   split — triage is a repeated read-then-decide, and reaching for the mouse
+   between each one is the slow part. */
+
+const list = document.getElementById("queue");
+const reader = document.getElementById("reader");
+
+/** Rendered readers, kept for the life of the page: arrowing back up a list
+    you have already read costs nothing after the first pass. */
+const readers = new Map();
+
+/** Which email the reader is currently meant to be showing. A fast run down
+    the list starts several fetches; only the newest one may paint. */
+let showing = null;
+
+const rows = () => [...list.querySelectorAll("article.mail")];
+const selectedRow = () => list.querySelector("article.mail.is-selected");
+
+function select(row, { focus = true } = {}) {
+  if (!row) return;
+  const previous = selectedRow();
+  if (previous && previous !== row) {
+    previous.classList.remove("is-selected");
+    previous.removeAttribute("aria-current");
+  }
+  row.classList.add("is-selected");
+  row.setAttribute("aria-current", "true");
+  // Move the tab stop with the selection. Without this, tabbing away and back
+  // returns to wherever the list started rather than where you actually are —
+  // and once that first row is marked done and removed, nothing in the list
+  // is tabbable at all.
+  for (const other of rows()) other.tabIndex = other === row ? 0 : -1;
+  if (focus) {
+    row.focus({ preventScroll: true });
+    row.scrollIntoView({ block: "nearest" });
+  }
+  render(row);
+}
+
+/** Paint the reader for a row, fetching its markup the first time.
+
+    The server renders the pane, so a date or a deadline is formatted by the
+    same code that formatted the row — there is no second implementation here
+    to drift out of step. */
+function render(row) {
+  const pk = row.dataset.pk;
+  showing = pk;
+  const tier = `reader tier ${row.dataset.tier || ""}`;
+
+  /* Always from the top: keeping the scroll position would drop you into the
+     middle of the next email at whatever depth you had reached in the last. */
+  const paint = (html) => {
+    reader.className = tier;
+    reader.innerHTML = html;
+    reader.scrollTop = 0;
+  };
+
+  if (readers.has(pk)) {
+    paint(readers.get(pk));
+    return;
+  }
+  reader.className = `${tier} is-loading`;
+  fetch(`/api/messages/${pk}/reader`)
+    .then((r) => (r.ok ? r.text() : Promise.reject(new Error(r.status))))
+    .then((html) => {
+      readers.set(pk, html);
+      // A fast arrow-key run starts several of these; by the time this one
+      // lands the reader may already be showing a later email.
+      if (showing === pk) paint(html);
+    })
+    .catch(() => {
+      if (showing === pk) {
+        paint('<div class="reader-placeholder">Could not load this email.</div>');
+      }
+    });
+}
+
+function move(delta) {
+  const all = rows();
+  if (!all.length) return;
+  const at = all.indexOf(selectedRow());
+  // No selection yet: Down starts at the top, Up starts at the bottom.
+  const next = at === -1 ? (delta > 0 ? 0 : all.length - 1) : at + delta;
+  select(all[Math.max(0, Math.min(all.length - 1, next))]);
+}
+
+/** After a row leaves the list, land on the one that took its place — or the
+    new last row, if what left was at the end. Triage should keep flowing
+    without a keystroke to re-find your place. */
+function selectNear(index) {
+  const all = rows();
+  if (!all.length) {
+    // dropRow has already hidden the split and shown the empty state; all that
+    // is left is to not leave the last email sitting in a pane no one can see.
+    showing = null;
+    reader.replaceChildren();
+    return;
+  }
+  select(all[Math.min(index, all.length - 1)]);
+}
+
+list.addEventListener("click", (e) => {
+  const row = e.target.closest("article.mail");
+  if (row) select(row);
+});
+
+/* ------------------------------------------------------------- shortcuts */
+
+document.addEventListener("keydown", (e) => {
+  // A dialog owns the keyboard while it is open, and so does any field — where
+  // Ctrl+Z has to keep meaning "undo my typing".
+  if (document.querySelector(".scrim:not([hidden])")) return;
+  const target = e.target;
+  if (target instanceof Element &&
+      target.closest("input, select, textarea, [contenteditable=''], [contenteditable=true]")) {
+    return;
+  }
+
+  // Checked before the guard below, because this is the one shortcut here that
+  // wants a modifier. Shift+Ctrl+Z is redo elsewhere; leave it alone rather
+  // than quietly treating it as another undo.
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
+    e.preventDefault();
+    undoLast();
+    return;
+  }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (!rows().length) return;
+    e.preventDefault();                  // or the page scrolls under the list
+    move(e.key === "ArrowDown" ? 1 : -1);
+  } else if (e.key === "e" || e.key === "E") {
+    const row = selectedRow();
+    // Held down, or pressed twice in a hurry, E would fire again on a row that
+    // is already animating out — two requests and two toasts for one decision.
+    if (!row || row.classList.contains("leaving")) return;
+    e.preventDefault();
+    // Toggle rather than always-done: on Completed the same key is the way
+    // back, and a key that does nothing on a whole view is a key you stop
+    // trusting.
+    setDone(Number(row.dataset.pk), !row.classList.contains("is-done"));
+  }
+});
+
+/* ----------------------------------------------------------------- done */
+
+/* The row is removed and the badges are repainted from the counts the server
    sends back, rather than reloading. A reload re-ran every dashboard query and
-   rebuilt the whole card list to change three numbers — and it threw away the
-   reader's scroll position on every single Done click. */
-async function setDone(pk, done, btn) {
+   rebuilt the whole list to change three numbers — and it threw away both the
+   reader's scroll position and the selection on every single Done. */
+async function setDone(pk, done, btn, { record = true } = {}) {
   try {
     const r = await api(`/api/messages/${pk}/handled?done=${done}`);
-    const card = document.getElementById(`mail-${pk}`);
-    if (card) {
-      card.classList.add("leaving");
-      setTimeout(() => dropCard(card), 300);
+    readers.delete(String(pk));   // its Done/Restore button just changed
+
+    const row = document.getElementById(`mail-${pk}`);
+    const entry = { pk, done, plan: null };
+    if (row) {
+      const index = rows().indexOf(row);
+      entry.plan = removalPlan(row);
+      // The row is only really gone once the exit animation ends, which is
+      // also the window in which Ctrl+Z is most likely to arrive — so the
+      // plan holds the timer and can call it off.
+      entry.plan.timer = setTimeout(() => {
+        dropRow(row);
+        selectNear(index);
+      }, 300);
+      row.classList.add("leaving");
     }
     applySummary(r.summary);
-    toastUndo(r.message, pk, !done);
+    if (record) undoStack.push(entry);
+    toastUndo(r.message, entry);
   } catch (e) {
     toast(e.message, false);
   }
 }
 
-/** Remove a card, keep its group's own count honest, and drop the group
+/** Remove a row, keep its group's own count honest, and drop the group
     entirely once it is empty so no orphaned heading is left behind. */
-function dropCard(card) {
-  const section = card.closest("section.tier");
-  card.remove();
+function dropRow(row) {
+  const section = row.closest("section.tier");
+  row.remove();
   if (section) {
-    const left = section.querySelectorAll("article.mail").length;
-    const n = section.querySelector(".tier-head .n");
-    if (n) n.textContent = left;
-    if (!left) section.remove();
+    retally(section);
+    if (!section.querySelector("article.mail")) section.remove();
   }
-  if (!document.querySelectorAll("#queue article.mail").length) {
-    const empty = document.getElementById("empty-state");
-    if (empty) empty.hidden = false;
+  syncEmptyState();
+}
+
+/** Keep a group's own count matching what is under it. */
+function retally(section) {
+  if (!section) return;
+  const n = section.querySelector(".tier-head .n");
+  if (n) n.textContent = section.querySelectorAll("article.mail").length;
+}
+
+/** Show the panes or the empty state, whichever the list now calls for. */
+function syncEmptyState() {
+  const any = rows().length > 0;
+  document.getElementById("empty-state")?.toggleAttribute("hidden", any);
+  document.querySelector(".split")?.toggleAttribute("hidden", !any);
+  document.querySelector(".shortcuts")?.toggleAttribute("hidden", !any);
+  if (any) sizePanes();
+}
+
+/* ----------------------------------------------------------------- undo */
+
+/* Marking mail done is the one destructive-feeling thing this page does, and
+   it is done in bursts — so the way back has to be as fast as the way in. The
+   toast carries Undo for six seconds; Ctrl+Z carries it for the whole session,
+   and repeated presses walk back through the burst.
+
+   Nothing is re-fetched to do it: the row element is kept, along with where it
+   sat, so putting it back is exact and the list does not jump. */
+const undoStack = [];
+
+/** Remember where a row lives, so it can be put back exactly there. */
+function removalPlan(row) {
+  const section = row.closest("section.tier");
+  const afterRow = row.nextElementSibling;
+  const afterSection = section ? section.nextElementSibling : null;
+  return {
+    timer: null,
+    restore() {
+      clearTimeout(this.timer);          // the row may still be on its way out
+      if (section && !section.isConnected) {
+        list.insertBefore(section, afterSection?.isConnected ? afterSection : null);
+      }
+      const parent = section || list;
+      // Whatever followed it may itself have been marked done since.
+      parent.insertBefore(row, afterRow?.isConnected ? afterRow : null);
+      row.classList.remove("leaving");
+      retally(section);
+      syncEmptyState();
+    },
+  };
+}
+
+async function undoEntry(entry) {
+  const at = undoStack.indexOf(entry);
+  if (at !== -1) undoStack.splice(at, 1);
+  try {
+    const r = await api(`/api/messages/${entry.pk}/handled?done=${!entry.done}`);
+    readers.delete(String(entry.pk));
+    entry.plan?.restore();
+    applySummary(r.summary);
+    const row = document.getElementById(`mail-${entry.pk}`);
+    if (row) {
+      row.classList.toggle("is-done", !entry.done);
+      select(row);
+    }
+    toast(r.message);
+  } catch (e) {
+    if (at !== -1) undoStack.splice(at, 0, entry);   // still undone, put it back
+    toast(e.message, false);
+  }
+}
+
+/** Ctrl+Z / Cmd+Z. Falls back to the server when this page has no history of
+    its own — a check finishes with a reload, and "undo" should not quietly
+    stop meaning anything just because the page was rebuilt underneath you. */
+async function undoLast() {
+  // Peeked, not popped: undoEntry takes it off the stack itself, and puts it
+  // back if the request fails — the action really is still undone.
+  const entry = undoStack[undoStack.length - 1];
+  if (entry) {
+    await undoEntry(entry);
+    return;
+  }
+  try {
+    const r = await api("/api/messages/undo-last");
+    if (!r.pk) {
+      toast("Nothing to undo.");
+      return;
+    }
+    toast(r.message);
+    setTimeout(() => location.reload(), 600);   // the row is not on this page
+  } catch (e) {
+    toast(e.message, false);
   }
 }
 
@@ -301,27 +559,11 @@ async function reclassifyOne(pk, btn) {
   });
 }
 
-/* ------------------------------------------------------------ lazy bodies */
-
-/* `toggle` does not bubble, so this listens in the capture phase. */
-document.addEventListener("toggle", (e) => {
-  const details = e.target;
-  if (!details.open || !details.classList || !details.classList.contains("detail")) return;
-  const pre = details.querySelector("pre[data-body]");
-  if (!pre || pre.dataset.loaded) return;
-  pre.dataset.loaded = "1";
-  fetch(`/api/messages/${pre.dataset.body}/body`)
-    .then((r) => r.json())
-    .then((d) => { pre.textContent = d.body || "(no body stored for this message)"; })
-    .catch(() => {
-      pre.dataset.loaded = "";       // let the next open try again
-      pre.textContent = "Could not load the message body.";
-    });
-}, true);
-
-/* Success toast carries Undo, per the design; Completed keeps a persistent
-   Restore for after the toast is gone. */
-function toastUndo(message, pk, revertTo) {
+/* Success toast carries Undo, per the design; Ctrl+Z carries it after the
+   toast is gone, and the reader keeps a persistent Restore after that. All
+   three run the same path now — the button used to reload the page, which
+   threw away the selection to change one row. */
+function toastUndo(message, entry) {
   const host = document.getElementById("toasts");
   const el = document.createElement("div");
   el.className = "toast ok";
@@ -330,10 +572,11 @@ function toastUndo(message, pk, revertTo) {
   const undo = document.createElement("button");
   undo.className = "toast-action";
   undo.textContent = "Undo";
-  undo.onclick = async () => {
+  undo.onclick = () => {
     el.remove();
-    await api(`/api/messages/${pk}/handled?done=${revertTo}`);
-    location.reload();
+    // This toast's own action, which is not always the newest one: by now the
+    // reader may have marked three more done behind it.
+    undoEntry(entry);
   };
   el.appendChild(undo);
   host.appendChild(el);
@@ -342,5 +585,38 @@ function toastUndo(message, pk, revertTo) {
     setTimeout(() => el.remove(), 260);
   }, 6000);
 }
+
+/* -------------------------------------------------------------- geometry */
+
+/* Fit the panes to what is left of the window below them.
+
+   This cannot be a constant. How far down the split begins depends on whether
+   a setup banner is showing and whether the filters are open, and getting it
+   wrong is not subtle: sized against the top of the window instead of their
+   own position, both panes hung ~140px below the fold, and `position: sticky`
+   could not save them because each pane was exactly as tall as its own grid
+   area and so had nowhere to travel. Measure it instead. */
+function sizePanes() {
+  const split = document.querySelector(".split");
+  if (!split || split.hidden) return;
+
+  const top = split.getBoundingClientRect().top + window.scrollY;
+  // Nothing follows the panes now except the page's own bottom padding — the
+  // shortcut hint moved up into the head band with the tabs and filters.
+  const height = Math.max(320, window.innerHeight - top - 20);
+  split.style.setProperty("--pane-height", `${height}px`);
+}
+
+window.addEventListener("resize", sizePanes);
+// Opening the filters pushes the split down the page; the panes give it back.
+document.querySelector(".filters")?.addEventListener("toggle", sizePanes);
+
+/* Open on the first email so the reader is never blank next to a full list,
+   without stealing focus from the page the reader just landed on. */
+document.addEventListener("DOMContentLoaded", () => {
+  sizePanes();
+  const first = rows()[0];
+  if (first) select(first, { focus: false });
+});
 </script>
 {% endblock %}

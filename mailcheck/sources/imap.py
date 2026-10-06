@@ -101,6 +101,11 @@ def _to_raw(msg, folder: str) -> RawMessage:
     from_name = (sender.name if sender else "") or ""
 
     dt = msg.date
+    # imap_tools returns 1900-01-01 for a Date header it cannot parse. Treat that
+    # as "no date": stored as-is it would look ancient, get pruned and re-fetched
+    # on every check, and never appear in a date window.
+    if dt is not None and dt.year < 1971:
+        dt = None
     if dt is not None and dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
 

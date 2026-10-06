@@ -9,18 +9,21 @@ from __future__ import annotations
 
 import threading
 import time
+import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlparse
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from .. import config as cfgmod
 from .. import db, outlook_auth, secrets
+from ..analytics import DashboardFilters, dashboard_data
 from ..pipeline import build_source, check_once, reclassify
 from ..sources import IMAPSource, SourceError
 from ..sources.presets import PRESETS, guess_from_email
@@ -35,6 +38,7 @@ from ..taxonomy import (
     label_of,
     tier_of,
 )
+from . import bodyhtml
 
 #: Tiers that make up the daily action queue. A failed classification
 #: (``unclassified``) is exactly the kind of thing that must not go unseen, so
@@ -43,12 +47,38 @@ ACTIONABLE_TIERS = (TIER_ACT, TIER_REPLY, TIER_UNKNOWN)
 ACTIONABLE_CATEGORIES = [c.name for c in CATEGORIES if c.tier in ACTIONABLE_TIERS]
 
 HERE = Path(__file__).parent
+FRONTEND_DIST = HERE / "frontend_dist"
 TEMPLATES = Jinja2Templates(directory=str(HERE / "templates"))
 
-_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+def _asset_version() -> str:
+    """Newest mtime across the static files, as a cache-busting stamp.
+
+    The stylesheet and the script are served without a Cache-Control header, so
+    a browser is free to reuse whatever it already has — which during any UI
+    work means an old layout rendered over new markup, and no way to tell that
+    from a bug. Stamping the URL makes an edited file a different URL, and the
+    question stops coming up.
+    """
+    newest = max(
+        (f.stat().st_mtime for f in (HERE / "static").glob("*") if f.is_file()),
+        default=0.0,
+    )
+    return str(int(newest))
+
+
+#: The function, not its result: a stylesheet edited while the server is up
+#: is exactly when a stale copy is most confusing, and a few stat() calls
+#: per render cost nothing on a single-user local app.
+TEMPLATES.env.globals["asset_v"] = _asset_version
+
+#: ``testserver`` is Starlette's TestClient host; it is not resolvable on a real
+#: network, so allowing it costs nothing.
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "testserver"}
 
 _job_lock = threading.Lock()
-_job: dict = {"running": False, "message": "", "detail": "", "at": None, "ok": True}
+_job: dict = {"running": False, "message": "", "detail": "", "at": None,
+              "ok": True, "stage_started": None, "completion_id": 0}
 
 #: In-flight Outlook device-code sign-in. Memory only — never written to disk.
 #: ``active_id`` names the one flow whose eventual result should be honoured;
@@ -56,6 +86,10 @@ _job: dict = {"running": False, "message": "", "detail": "", "at": None, "ok": T
 #: superseded attempt can never save a token or create an account after the
 #: fact — see the staleness checks in ``api_outlook_start``.
 _outlook: dict = {"pending": None, "active_id": None, "state": "idle", "message": "", "email": ""}
+#: Makes "is this flow still the active one?" and "save the account" one step.
+#: Without it a cancel landing between the two leaves an account behind that
+#: the user just cancelled.
+_outlook_lock = threading.Lock()
 
 #: Wall-clock epoch seconds of the next automatic check, or None when auto is off.
 _sched: dict = {"next_due": None}
@@ -76,7 +110,7 @@ def _reschedule(cfg=None) -> None:
 
 class CheckBody(BaseModel):
     account: str | None = None
-    since_days: int | None = None
+    since_days: int | None = Field(default=None, ge=1, le=3650)
     no_cache: bool = False
 
 
@@ -86,7 +120,7 @@ class ReclassifyBody(BaseModel):
 
     pks: list[int] | None = None
     account: str | None = None
-    days: int | None = None
+    days: int | None = Field(default=None, ge=1, le=3650)
 
 
 class AccountBody(BaseModel):
@@ -108,7 +142,11 @@ class SettingsBody(BaseModel):
     outlook_client_id: str | None = None
     base_url: str | None = None
     model: str | None = None
-    token: str | None = None
+    num_ctx: int | None = None
+    think: bool | None = None
+    keep_alive: str | None = None
+    timeout_seconds: int | None = None
+    classification_deadline_seconds: int | None = None
     batch_size: int | None = None
     max_body_chars: int | None = None
     concurrency: int | None = None
@@ -123,6 +161,100 @@ class RuleBody(BaseModel):
     sender: str | None = None
     sender_domain: str | None = None
     subject_contains: str | None = None
+
+
+class MessageSummary(BaseModel):
+    pk: int
+    message_id: str
+    subject: str
+    from_addr: str
+    from_name: str
+    date_utc: str | None = None
+    snippet: str = ""
+    provider_url: str | None = None
+    handled_at: str | None = None
+    account_label: str
+    provider: str = "imap"
+    category: str
+    confidence: float = 0
+    company: str | None = None
+    role: str | None = None
+    deadline: str | None = None
+    action_required: bool = False
+    summary: str = ""
+    source: str = "llm"
+    retryable: bool = False
+    tier: str
+    category_label: str
+    date_estimated: bool
+    date_display: str
+    deadline_display: str
+    open_url: str | None = None
+    open_label: str = ""
+
+
+class TriageGroup(BaseModel):
+    tier: str
+    label: str
+    items: list[MessageSummary]
+
+
+class TriageResponse(BaseModel):
+    view: str
+    groups: list[TriageGroup]
+    summary: dict[str, int]
+    counts: dict[str, int]
+    accounts: list[dict[str, Any]]
+    selected_account: str | None
+    selected_category: str | None
+    days: int
+    total: int
+
+
+class PublicAccount(BaseModel):
+    id: int
+    label: str
+    email: str
+    provider: str
+    imap_host: str
+    imap_port: int
+    use_ssl: bool
+    folder: str
+    enabled: bool
+
+
+class AccountsResponse(BaseModel):
+    accounts: list[PublicAccount]
+    outlook_ready: bool
+
+
+class ReaderResponse(BaseModel):
+    message: MessageSummary
+    body_html: str
+
+
+class BootstrapReadiness(BaseModel):
+    model: bool
+    accounts: bool
+    privacy_ack: bool
+    outlook: bool
+
+
+class BootstrapResponse(BaseModel):
+    readiness: BootstrapReadiness
+    counts: dict[str, int]
+    taxonomy: list[dict[str, str]]
+    presets: list[dict[str, Any]]
+    last_run: str
+    account_count: int
+
+
+class SettingsResponse(BaseModel):
+    settings: dict[str, Any]
+    rules: list[dict[str, Any]]
+    categories: list[dict[str, str]]
+    config_path: str
+    db_path: str
 
 
 # ------------------------------------------------------------------------- helpers
@@ -143,17 +275,17 @@ def _state(conn=None, accounts=None) -> dict:
     if conn is None:
         with db.session() as own:
             accounts = db.list_accounts(own)
-            summary = db.queue_counts(own)
+            summary = db.queue_counts(own, since_iso=_default_since())
     else:
         if accounts is None:
             accounts = db.list_accounts(conn)
         # Same definition as the queue itself (unhandled act/reply/unknown), so
         # the nav dot means exactly "there is something in your queue" — not a
         # lifetime count that includes mail already marked Done.
-        summary = db.queue_counts(conn)
+        summary = db.queue_counts(conn, since_iso=_default_since())
     due = _sched["next_due"]
     return {
-        "llm_ready": cfg.is_llm_ready() and secrets.has_llm_token(),
+        "llm_ready": cfg.is_llm_ready(),
         "has_accounts": any(a.enabled for a in accounts),
         "account_count": len(accounts),
         "urgent_count": summary["actionable"],
@@ -166,6 +298,15 @@ def _state(conn=None, accounts=None) -> dict:
 
 URGENT_CATEGORIES = [c.name for c in CATEGORIES if c.tier == TIER_ACT]
 
+#: The queue's default window (``days=30``). The nav badge and bootstrap counts
+#: use the same one, so the number on the badge is the number the queue shows —
+#: mail older than that can outlive it locally when ``retain_days`` is larger.
+DEFAULT_DAYS = 30
+
+
+def _default_since() -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=DEFAULT_DAYS)).isoformat()
+
 
 def _start_job(work, *, failed: str, on_finish=None) -> None:
     """Run ``work`` on a thread against the shared ``_job`` status block.
@@ -177,13 +318,15 @@ def _start_job(work, *, failed: str, on_finish=None) -> None:
     """
 
     def runner():
-        _job.update(running=True, message="Connecting…", detail="", ok=True)
+        _job.update(running=True, message="Connecting…", detail="", ok=True,
+                    stage_started=time.time())
         try:
             work()
         except Exception as exc:  # noqa: BLE001 - surface it in the UI, never 500
             _job.update(message=failed, detail=str(exc), ok=False)
         finally:
-            _job.update(running=False, at=datetime.now().strftime("%H:%M"))
+            _job.update(running=False, at=datetime.now().strftime("%H:%M"),
+                        stage_started=None, completion_id=_job["completion_id"] + 1)
             if on_finish is not None:
                 on_finish()
             _job_lock.release()
@@ -194,6 +337,23 @@ def _start_job(work, *, failed: str, on_finish=None) -> None:
 def _run_check(body: CheckBody) -> None:
     def work():
         cfg = cfgmod.load()
+
+        def event(values: dict) -> None:
+            if values.get("type") == "llm_request_started":
+                _job.update(
+                    message=(f"Classifying batch {values['batch_index']} of "
+                             f"{values['total_batches']} · {values['completed']} of "
+                             f"{values.get('total', '?')} complete"),
+                    stage_started=time.time(),
+                )
+            elif values.get("type") == "model_loading":
+                _job.update(message="Loading the model into memory — this can take a couple of minutes…",
+                            stage_started=time.time())
+            elif values.get("type") == "llm_request" and values.get("outcome") in {
+                "timeout", "busy", "deadline"
+            }:
+                _job.update(message="Ollama busy; remaining mail will retry next check")
+
         with db.session() as conn:
             result = check_once(
                 conn,
@@ -205,6 +365,7 @@ def _run_check(body: CheckBody) -> None:
                 progress=lambda done, total: _job.update(
                     message=f"Classifying… {done} of {total}"
                 ),
+                event=event,
             )
         bits = [f"{result.fetched} unread", f"{result.classified} classified"]
         if result.from_cache:
@@ -213,10 +374,12 @@ def _run_check(body: CheckBody) -> None:
             bits.append(f"{result.prefiltered} filtered locally")
         if result.pruned:
             bits.append(f"{result.pruned} aged out")
+        if result.retryable:
+            bits.append(f"{result.retryable} deferred; Ollama busy — retry next check")
         _job.update(
             message=" · ".join(bits),
             detail="\n".join(result.errors[:5]),
-            ok=not result.errors,
+            ok=not result.errors or result.retryable > 0,
         )
 
     # A manual check counts as a check: restart the clock from now.
@@ -226,6 +389,23 @@ def _run_check(body: CheckBody) -> None:
 def _run_reclassify(body: ReclassifyBody) -> None:
     def work():
         cfg = cfgmod.load()
+
+        def event(values: dict) -> None:
+            if values.get("type") == "llm_request_started":
+                _job.update(
+                    message=(f"Re-classifying batch {values['batch_index']} of "
+                             f"{values['total_batches']} · {values['completed']} of "
+                             f"{values.get('total', '?')} complete"),
+                    stage_started=time.time(),
+                )
+            elif values.get("type") == "model_loading":
+                _job.update(message="Loading the model into memory — this can take a couple of minutes…",
+                            stage_started=time.time())
+            elif values.get("type") == "llm_request" and values.get("outcome") in {
+                "timeout", "busy", "deadline"
+            }:
+                _job.update(message="Ollama busy; press Retry again to continue")
+
         with db.session() as conn:
             result = reclassify(
                 conn,
@@ -237,6 +417,7 @@ def _run_reclassify(body: ReclassifyBody) -> None:
                 progress=lambda done, total: _job.update(
                     message=f"Re-classifying… {done} of {total}"
                 ),
+                event=event,
             )
         if not result.fetched:
             _job.update(message="Nothing left to re-classify.", detail="", ok=True)
@@ -245,6 +426,8 @@ def _run_reclassify(body: ReclassifyBody) -> None:
         bits = [f"{result.classified + result.prefiltered} of {result.fetched} resolved"]
         if still:
             bits.append(f"{still} still unclassified")
+        if result.retryable:
+            bits.append("Ollama busy — press Retry again to continue")
         _job.update(
             message=" · ".join(bits),
             detail="\n".join(result.errors[:5]),
@@ -291,6 +474,40 @@ def _scheduler() -> None:
 def create_app() -> FastAPI:
     app = FastAPI(title="mail-check", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
+    if (FRONTEND_DIST / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+    def frontend_page():
+        index = FRONTEND_DIST / "index.html"
+        if index.is_file():
+            # The shell points at content-hashed assets. Always revalidate the
+            # shell so a browser cannot keep references from an older build.
+            return FileResponse(index, headers={"Cache-Control": "no-cache, must-revalidate"})
+        return None
+
+    @app.exception_handler(tomllib.TOMLDecodeError)
+    async def unreadable_config(request: Request, exc: tomllib.TOMLDecodeError):
+        # The parser's message can quote the offending line, so it is not echoed.
+        return PlainTextResponse(
+            f"The saved configuration at {cfgmod.config_path()} is not valid TOML.\n\n"
+            "Fix or delete the file, then reload this page.",
+            status_code=503,
+        )
+
+    @app.exception_handler(ValidationError)
+    async def invalid_saved_config(request: Request, exc: ValidationError):
+        # Validation errors may contain old endpoint credentials or other values.
+        # Show recovery instructions without echoing the invalid input.
+        return PlainTextResponse(
+            f"The saved configuration at {cfgmod.config_path()} needs updating.\n\n"
+            "For an old model endpoint, run:\n"
+            "mail-check init --base-url http://192.168.2.230:11440 "
+            "--model qwen3.5:35b-a3b\n\n"
+            "This backs up the existing configuration and preserves other settings. "
+            "If another setting is invalid, correct it in the configuration file, "
+            "then reload this page. Automatic checks cannot run until it is valid.",
+            status_code=503,
+        )
 
     if not _scheduler_started.is_set():
         _scheduler_started.set()
@@ -298,6 +515,12 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def same_origin_only(request: Request, call_next):
+        # DNS rebinding: a page on an attacker's domain that resolves to
+        # 127.0.0.1 makes same-origin GETs to this server, and the Origin check
+        # below never sees them. Its requests still carry the attacker's Host.
+        host = urlparse("//" + request.headers.get("host", "")).hostname or ""
+        if host not in _LOCAL_HOSTS:
+            return _err("Unrecognised Host header.", 403)
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin")
             if origin and (urlparse(origin).hostname or "") not in _LOCAL_HOSTS:
@@ -306,13 +529,146 @@ def create_app() -> FastAPI:
 
     # ------------------------------------------------------------------- pages
 
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def analytics_dashboard(request: Request):
+        page = frontend_page()
+        if page:
+            return page
+        with db.session() as conn:
+            accounts = db.list_accounts(conn)
+            state = _state(conn, accounts)
+        return TEMPLATES.TemplateResponse(request, "analytics.html", {
+            "page": "analytics", "main_class": "wide", "accounts": accounts,
+            "categories": CATEGORIES, **state,
+        })
+
+    @app.get("/api/dashboard")
+    def api_dashboard(request: Request):
+        values = dict(request.query_params)
+        values.pop("category", None)
+        values["categories"] = request.query_params.getlist("category")
+        try:
+            filters = DashboardFilters.model_validate(values)
+        except ValidationError as exc:
+            return _err(exc.errors()[0]["msg"])
+        cfg = cfgmod.load()
+        with db.session() as conn:
+            return dashboard_data(conn, filters, retention_days=cfg.check.retain_days)
+
+    @app.get("/api/bootstrap", response_model=BootstrapResponse)
+    def api_bootstrap():
+        """Small, non-sensitive shell data shared by every React page."""
+        with db.session() as conn:
+            accounts = db.list_accounts(conn)
+            state = _state(conn, accounts)
+            run = db.last_run(conn)
+            summary = db.queue_counts(conn, since_iso=_default_since())
+        return {
+            "readiness": {
+                "model": state["llm_ready"],
+                "accounts": state["has_accounts"],
+                "privacy_ack": state["cfg"].privacy_ack,
+                "outlook": bool(state["cfg"].outlook.client_id),
+            },
+            "counts": summary,
+            "taxonomy": [{"name": c.name, "label": c.label, "tier": c.tier}
+                         for c in CATEGORIES],
+            "presets": [{"key": p.key, "name": p.name, "host": p.host,
+                         "port": p.port, "use_ssl": p.use_ssl, "note": p.note,
+                         "supported": p.supported} for p in PRESETS],
+            "last_run": _fmt_run(run),
+            "account_count": state["account_count"],
+        }
+
+    @app.get("/api/triage", response_model=TriageResponse)
+    def api_triage(view: str = "queue", category: str | None = None,
+                   account: str | None = None, days: int = 30):
+        """Read the same bounded, body-free rows as the original console."""
+        if view not in ("queue", "all", "completed"):
+            return _err("Unknown mail view.")
+        if days not in (2, 3, 7, 14, 30, 90):
+            return _err("Choose a supported time range.")
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        handled = {"queue": False, "completed": True, "all": None}[view]
+        with db.session() as conn:
+            rows = db.query_triaged(
+                conn,
+                categories=([category] if category else
+                            ACTIONABLE_CATEGORIES if view == "queue" else None),
+                account_label=account,
+                since_iso=since,
+                handled=handled,
+                limit=500,
+            )
+            counts = db.category_counts(conn, since_iso=since, account_label=account,
+                                        handled=handled)
+            summary = db.queue_counts(conn, since_iso=since, account_label=account)
+            accounts = db.list_accounts(conn)
+        grouped: dict[str, list] = {tier: [] for tier in TIER_ORDER}
+        for row in rows:
+            item = _decorate(row)
+            grouped[item["tier"]].append(item)
+        return {
+            "view": view,
+            "groups": [{"tier": tier, "label": TIER_META[tier][0],
+                        "items": grouped[tier]} for tier in TIER_ORDER if grouped[tier]],
+            "summary": summary,
+            "counts": counts,
+            "accounts": [{"label": a.label, "enabled": a.enabled} for a in accounts],
+            "selected_account": account,
+            "selected_category": category,
+            "days": days,
+            "total": len(rows),
+        }
+
+    @app.get("/api/messages/{pk}", response_model=ReaderResponse)
+    def api_message(pk: int):
+        with db.session() as conn:
+            row = db.get_triaged(conn, pk)
+            if not row:
+                return _err("No such message.", 404)
+            body_html = bodyhtml.render_body(row["body_text"])
+        return {"message": _decorate(row), "body_html": str(body_html)}
+
+    @app.get("/api/accounts", response_model=AccountsResponse)
+    def api_accounts():
+        with db.session() as conn:
+            accounts = db.list_accounts(conn)
+        return {
+            "accounts": [{
+                "id": a.id, "label": a.label, "email": a.email,
+                "provider": a.provider, "imap_host": a.imap_host,
+                "imap_port": a.imap_port, "use_ssl": a.use_ssl,
+                "folder": a.folder, "enabled": a.enabled,
+            } for a in accounts],
+            "outlook_ready": bool(cfgmod.load().outlook.client_id),
+        }
+
+    @app.get("/api/settings", response_model=SettingsResponse)
+    def api_settings():
+        cfg = cfgmod.load()
+        return {
+            "settings": {
+                "llm": cfg.llm.model_dump(),
+                "check": cfg.check.model_dump(),
+                "watch": cfg.watch.model_dump(),
+                "outlook": cfg.outlook.model_dump(),
+                "privacy_ack": cfg.privacy_ack,
+            },
+            "rules": [rule.model_dump() for rule in cfg.prefilter_rules],
+            "categories": [{"name": c.name, "label": c.label}
+                           for c in CATEGORIES if c.name != UNCLASSIFIED],
+            "config_path": str(cfgmod.config_path()),
+            "db_path": str(cfgmod.db_path()),
+        }
+
     @app.get("/", response_class=HTMLResponse)
     def dashboard(
         request: Request,
         view: str = "queue",
         category: str | None = None,
         account: str | None = None,
-        days: int = 30,
+        days: int = Query(30, ge=1, le=3650),
     ):
         """One template, three views.
 
@@ -320,6 +676,9 @@ def create_app() -> FastAPI:
         all       — everything, grouped by tier.
         completed — locally handled items, most recent first.
         """
+        page = frontend_page()
+        if page:
+            return page
         if view not in ("queue", "all", "completed"):
             view = "queue"
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -362,12 +721,7 @@ def create_app() -> FastAPI:
 
         groups: dict[str, list] = {t: [] for t in TIER_ORDER}
         for row in rows:
-            item = dict(row)
-            item["tier"] = tier_of(row["category"])
-            item["category_label"] = label_of(row["category"])
-            item["date_display"] = _fmt_date(row["date_utc"])
-            item["deadline_display"] = _fmt_deadline(row["deadline"])
-            item["open_url"], item["open_label"] = _open_link(row)
+            item = _decorate(row)
             groups[item["tier"]].append(item)
 
         return TEMPLATES.TemplateResponse(
@@ -375,6 +729,9 @@ def create_app() -> FastAPI:
             "dashboard.html",
             {
                 "page": "triage",
+                # Triage is the one page laid out in two panes; the rest are
+                # single-column reading width and must stay that way.
+                "main_class": "wide",
                 "view": view,
                 "groups": groups,
                 "tier_order": TIER_ORDER,
@@ -404,7 +761,7 @@ def create_app() -> FastAPI:
         error, or the tab closing mid-flight.
         """
         with db.session() as conn:
-            rows = db.pending_notifications(conn, URGENT_CATEGORIES)
+            rows = db.pending_notifications(conn, URGENT_CATEGORIES, since_iso=_default_since())
             items = [
                 {
                     "pk": r["pk"],
@@ -442,7 +799,7 @@ def create_app() -> FastAPI:
             if not row:
                 return _err("No such message.", 404)
             db.set_handled(conn, pk, done)
-            summary = db.queue_counts(conn)
+            summary = db.queue_counts(conn, since_iso=_default_since())
         return {
             "ok": True,
             "message": "Marked done." if done else "Restored to the queue.",
@@ -451,13 +808,65 @@ def create_app() -> FastAPI:
             "summary": summary,
         }
 
+    @app.post("/api/messages/undo-last")
+    def api_undo_last():
+        """Restore the most recently completed message.
+
+        The console undoes from its own in-page history, which is exact and
+        needs no round trip. This is the fallback for when that history is
+        gone — a finished check reloads the page — so that Ctrl+Z keeps
+        working rather than silently doing nothing.
+        """
+        with db.session() as conn:
+            row = db.last_handled(conn)
+            if not row:
+                return {"ok": True, "pk": None, "message": "Nothing to undo."}
+            db.set_handled(conn, row["pk"], False)
+            summary = db.queue_counts(conn, since_iso=_default_since())
+        subject = (row["subject"] or "").strip()
+        return {
+            "ok": True,
+            "pk": row["pk"],
+            "message": f"Restored “{subject[:60]}”." if subject else "Restored to the queue.",
+            "summary": summary,
+        }
+
+    @app.get("/api/messages/{pk}/reader", response_class=HTMLResponse)
+    def api_message_reader(request: Request, pk: int):
+        """The right-hand pane for one message, rendered server-side.
+
+        Sending this with the page instead — a hidden block per row — put half
+        the document's bytes into detail for mail the reader looks at one at a
+        time, which is the same trade already rejected for bodies. Fetching it
+        on selection also keeps every formatted value coming from the same
+        template as the list, rather than being rebuilt in JavaScript.
+        """
+        with db.session() as conn:
+            row = db.get_triaged(conn, pk)
+            if not row:
+                return HTMLResponse("<p class=\"reader-placeholder\">No such message.</p>", 404)
+            state = _state(conn)
+        return TEMPLATES.TemplateResponse(
+            request,
+            "reader.html",
+            {
+                "i": _decorate(row),
+                "llm_ready": state["llm_ready"],
+                # Rendered here rather than in the template: it is escaping
+                # work on hostile input, which belongs in tested code and not
+                # in a filter chain.
+                "body_html": bodyhtml.render_body(row["body_text"]),
+            },
+        )
+
     @app.get("/api/messages/{pk}/body")
     def api_message_body(pk: int):
-        """The stored body, fetched only when the user opens Details.
+        """The stored body on its own, as JSON.
 
-        Bodies are by far the largest column, and a list of 500 of them is most
-        of the dashboard's weight for something the reader looks at one at a
-        time — if at all.
+        The console no longer calls this — the reader fragment above arrives
+        with the body already in it, in one round trip instead of two. Kept
+        because it is the one way to read a stored body without asking for a
+        page of markup around it.
         """
         with db.session() as conn:
             body = db.get_message_body(conn, pk)
@@ -467,6 +876,9 @@ def create_app() -> FastAPI:
 
     @app.get("/accounts", response_class=HTMLResponse)
     def accounts_page(request: Request):
+        page = frontend_page()
+        if page:
+            return page
         with db.session() as conn:
             accounts = db.list_accounts(conn)
             state = _state(conn, accounts)
@@ -484,13 +896,15 @@ def create_app() -> FastAPI:
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
+        page = frontend_page()
+        if page:
+            return page
         state = _state()
         return TEMPLATES.TemplateResponse(
             request,
             "settings.html",
             {
                 "page": "settings",
-                "has_token": secrets.has_llm_token(),
                 "categories": [c for c in CATEGORIES if c.name != "unclassified"],
                 "config_path": str(cfgmod.config_path()),
                 "db_path": str(cfgmod.db_path()),
@@ -547,11 +961,16 @@ def create_app() -> FastAPI:
         due = _sched["next_due"]
         return {
             **_job,
+            "completion_id": _job["completion_id"],
             "auto": cfg.watch.auto_check,
             "interval_minutes": cfg.watch.interval_minutes,
             # Seconds remaining, so the browser never has to trust its own clock
             # agreeing with the server's.
             "next_in": max(0, int(due - time.time())) if due else None,
+            "stage_elapsed": (
+                max(0, int(time.time() - _job["stage_started"]))
+                if _job["running"] and _job.get("stage_started") else None
+            ),
         }
 
     @app.post("/api/autocheck")
@@ -679,9 +1098,10 @@ def create_app() -> FastAPI:
         except outlook_auth.OutlookAuthError as exc:
             return _err(str(exc))
 
-        _outlook.update(
-            pending=pending, active_id=pending.id, state="waiting", message="", email=""
-        )
+        with _outlook_lock:
+            _outlook.update(
+                pending=pending, active_id=pending.id, state="waiting", message="", email=""
+            )
 
         def wait():
             flow_id = pending.id
@@ -704,17 +1124,19 @@ def create_app() -> FastAPI:
             # Success — but if this flow was cancelled or superseded while we
             # were blocked, the cancellation is authoritative: the token we
             # just saved must not survive, and the account must not appear.
-            if _outlook.get("active_id") != flow_id:
-                outlook_auth.delete_cache(label)
-                return
-            with db.session() as conn:
-                if not db.get_account(conn, label):
-                    db.add_account(
-                        conn, label=label, email=email or label, provider="outlook"
-                    )
-            _outlook.update(
-                pending=None, state="connected", email=email, message=f"Connected {email}."
-            )
+            with _outlook_lock:
+                if _outlook.get("active_id") != flow_id:
+                    outlook_auth.delete_cache(label)
+                    return
+                with db.session() as conn:
+                    if not db.get_account(conn, label):
+                        db.add_account(
+                            conn, label=label, email=email or label, provider="outlook"
+                        )
+                _outlook.update(
+                    pending=None, state="connected", email=email,
+                    message=f"Connected {email}.",
+                )
 
         threading.Thread(target=wait, daemon=True).start()
         return {
@@ -746,18 +1168,26 @@ def create_app() -> FastAPI:
 
     @app.post("/api/outlook/cancel")
     def api_outlook_cancel():
-        pending = _outlook.get("pending")
-        if pending is not None:
-            outlook_auth.abort(pending)              # unblocks the background thread
-            outlook_auth.delete_cache(pending.label)  # in case it already wrote one
-        _outlook.update(pending=None, active_id=None, state="idle", message="", email="")
+        with _outlook_lock:
+            if _outlook["state"] == "connected":
+                # The sign-in finished first; the account exists and is kept.
+                return {"ok": True, "message": "Already connected."}
+            pending = _outlook.get("pending")
+            if pending is not None:
+                outlook_auth.abort(pending)              # unblocks the background thread
+                outlook_auth.delete_cache(pending.label)  # in case it already wrote one
+            _outlook.update(pending=None, active_id=None, state="idle", message="", email="")
         return {"ok": True, "message": "Sign-in cancelled."}
 
     @app.post("/api/settings")
     def api_settings(body: SettingsBody):
         cfg = cfgmod.load()
         data = cfg.model_dump()
-        for field in ("base_url", "model", "batch_size", "max_body_chars", "concurrency"):
+        for field in (
+            "base_url", "model", "batch_size", "max_body_chars", "concurrency",
+            "num_ctx", "think", "keep_alive", "timeout_seconds",
+            "classification_deadline_seconds",
+        ):
             value = getattr(body, field)
             if value is not None:
                 data["llm"][field] = value
@@ -780,8 +1210,6 @@ def create_app() -> FastAPI:
             msg = detail()[0]["msg"] if callable(detail) and detail() else str(exc)
             return _err(msg)
         cfgmod.save(cfg)
-        if body.token:
-            secrets.set_llm_token(body.token)
         _reschedule(cfg)  # a changed interval takes effect immediately
         return {"ok": True, "message": "Settings saved."}
 
@@ -793,20 +1221,16 @@ def create_app() -> FastAPI:
         if not cfg.is_llm_ready():
             return _err("Set a base URL and model first.")
         try:
-            with LLMClient(
-                base_url=cfg.llm.base_url,
-                token=secrets.get_llm_token(),
-                model=cfg.llm.model,
-                timeout=cfg.llm.timeout_seconds,
-                max_retries=2,
-            ) as client:
+            with LLMClient.from_config(cfg.llm) as client:
                 reply = client.ping()
-        except (LLMError, secrets.SecretError) as exc:
+        except LLMError as exc:
             return _err(str(exc))
         return {"ok": True, "message": f"Model replied: {reply.strip()[:120]}"}
 
     @app.post("/api/rules")
     def api_add_rule(body: RuleBody):
+        if body.category not in {c.name for c in CATEGORIES} or body.category == UNCLASSIFIED:
+            return _err("Choose one of the listed categories.")
         if not (body.sender or body.sender_domain or body.subject_contains):
             return _err("A rule needs at least one condition.")
         cfg = cfgmod.load()
@@ -822,6 +1246,20 @@ def create_app() -> FastAPI:
         cfg.prefilter_rules.pop(index)
         cfgmod.save(cfg)
         return {"ok": True, "message": "Rule removed."}
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def frontend_route(path: str):
+        if path == "api" or path.startswith("api/"):
+            return _err("Not found.", 404)
+        # Let the SPA own deep links only after it has been built. The legacy
+        # template UI remains available in editable Python installs until then.
+        if FRONTEND_DIST.is_dir() and (FRONTEND_DIST / "index.html").is_file():
+            index = (FRONTEND_DIST / "index.html").resolve()
+            requested = (FRONTEND_DIST / path).resolve()
+            if requested.is_relative_to(FRONTEND_DIST.resolve()) and requested.is_file():
+                return FileResponse(requested)
+            return FileResponse(index, headers={"Cache-Control": "no-cache, must-revalidate"})
+        return JSONResponse({"ok": False, "error": "Not found."}, status_code=404)
 
     return app
 
@@ -843,7 +1281,12 @@ def _fmt_date(value: str | None) -> str:
         dt = datetime.fromisoformat(value)
     except ValueError:
         return value[:16]
-    dt = dt.replace(tzinfo=None)
+    # Stored dates are UTC — ``date_utc`` as a naive value, ``fetched_at`` with an
+    # offset. Convert to local time before comparing against the local clock,
+    # or "today" and "Yesterday" flip at the wrong hour and times read as UTC.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone().replace(tzinfo=None)
     now = datetime.now()
     days = (dt.date() - now.date()).days
 
@@ -880,6 +1323,22 @@ def _fmt_deadline(value: str | None) -> str:
     return f"Due {_short_date(datetime.combine(due, datetime.min.time()))}"
 
 
+def _decorate(row) -> dict:
+    """Add the display-only fields the templates read.
+
+    Shared by the list and the reader so a date, a deadline or an open link is
+    formatted once, by one piece of code, however it reaches the page.
+    """
+    item = dict(row)
+    item["tier"] = tier_of(row["category"])
+    item["category_label"] = label_of(row["category"])
+    item["date_estimated"] = not bool(row["date_utc"])
+    item["date_display"] = _fmt_date(row["date_utc"] or item.get("fetched_at"))
+    item["deadline_display"] = _fmt_deadline(row["deadline"])
+    item["open_url"], item["open_label"] = _open_link(row)
+    return item
+
+
 def _open_link(row) -> tuple[str | None, str]:
     """Prefer the provider's own deep link.
 
@@ -898,8 +1357,12 @@ def _open_link(row) -> tuple[str | None, str]:
 
     host = ((row["imap_host"] if "imap_host" in keys else "") or "").lower()
     if "gmail" in host or "google" in host:
+        # /u/0/ is whichever Google account is signed in first, which is not
+        # necessarily this mailbox; authuser names the account explicitly.
+        email = (row["account_email"] if "account_email" in keys else "") or ""
+        account = f"?authuser={quote(email, safe='')}" if email else ""
         return (
-            "https://mail.google.com/mail/u/0/#search/rfc822msgid:"
+            f"https://mail.google.com/mail/{account}#search/rfc822msgid:"
             f"{quote(row['message_id'])}",
             "Open in Gmail",
         )

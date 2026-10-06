@@ -2,6 +2,11 @@
 
 Free models are unreliable at JSON. This module assumes that: it recovers what
 it can, per item, rather than failing a whole batch.
+
+Two habits of reasoning models drove most of the recovery code here. They stop
+one brace short of closing the object, or run out of budget mid-string, and the
+answer we needed is sitting complete in the part that did arrive; and they key
+``results`` by id instead of listing it. Both used to cost the whole reply.
 """
 
 from __future__ import annotations
@@ -92,11 +97,96 @@ class ItemResult(BaseModel):
         return " ".join(str(v).split())[:400]
 
 
+#: How many times a cut-off reply may be trimmed back looking for a parse.
+#: Each step drops one fragment, so a handful covers any real truncation.
+_MAX_REPAIR_TRIMS = 8
+
+
+def _scan(body: str) -> tuple[list[str], bool, list[int]]:
+    """Walk JSON text, ignoring brackets inside strings.
+
+    Returns the still-open brackets, whether the walk ended inside a string,
+    and the offsets we may safely cut back to - each structural comma, and the
+    position just after each opener.
+    """
+    stack: list[str] = []
+    cuts: list[int] = []
+    in_string = False
+    escape = False
+    for i, ch in enumerate(body):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+            cuts.append(i + 1)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+        elif ch == ",":
+            cuts.append(i)
+    return stack, in_string, cuts
+
+
+def _close(body: str) -> str | None:
+    """Terminate an open string and close every open bracket."""
+    stack, in_string, _ = _scan(body)
+    if not stack and not in_string:
+        return None  # already balanced - whatever is wrong, it is not this
+    return (
+        body
+        + ('"' if in_string else "")
+        + "".join("}" if ch == "{" else "]" for ch in reversed(stack))
+    )
+
+
+def repair_json(text: str) -> str | None:
+    """Close a reply that was cut off, or that stopped a brace short.
+
+    Reasoning models spend their budget thinking and get truncated mid-answer,
+    and this one also simply miscounts its closing braces. Either way the
+    fields we need already arrived and only the tail is missing, so close what
+    is open and see if it parses. When the cut landed mid-key - `"confidence`
+    with no value - closing alone leaves nonsense, so drop the half-written
+    fragment and try again from the previous comma.
+
+    Returns the repaired text, or ``None`` if nothing here can be salvaged.
+    Never invents a field: an item whose category had not been written yet
+    simply fails validation later and is retried like any other missing id.
+    """
+    first = min((i for i in (text.find("{"), text.find("[")) if i != -1), default=-1)
+    if first == -1:
+        return None
+
+    body = text[first:]
+    for _ in range(_MAX_REPAIR_TRIMS):
+        closed = _close(body)
+        if closed is not None:
+            try:
+                json.loads(closed)
+                return closed
+            except json.JSONDecodeError:
+                pass
+        _, _, cuts = _scan(body)
+        if not cuts or cuts[-1] >= len(body):
+            return None  # no fragment left to drop, or dropping it changes nothing
+        body = body[: cuts[-1]]
+    return None
+
+
 def extract_json(text: str) -> Any:
     """Get a JSON value out of whatever the model returned.
 
-    Handles: clean JSON, fenced JSON, JSON with prose around it, and a bare
-    array where an object was requested.
+    Handles: clean JSON, fenced JSON, JSON with prose around it, a bare array
+    where an object was requested, and a reply that was cut off before it
+    finished.
     """
     if not text:
         raise ValueError("empty response")
@@ -119,7 +209,32 @@ def extract_json(text: str) -> Any:
                 return json.loads(block)
             except json.JSONDecodeError:
                 continue
-    raise ValueError(f"no JSON found in response: {text[:200]!r}")
+
+    # Last resort: nothing balanced parsed, so assume the reply was cut short
+    # and close it ourselves.
+    repaired = repair_json(candidate)
+    if repaired is not None:
+        value = json.loads(repaired)
+        # Trimming can strip a reply back to `{}` - true of prose that merely
+        # contains a stray brace. An empty container is not a recovery, and
+        # returning one would report "parsed, nothing in it" for what is really
+        # an unusable reply, so keep treating it as a failure.
+        if value:
+            return value
+
+    raise ValueError(f"no JSON found in response: {_excerpt(text)}")
+
+
+def _excerpt(text: str, limit: int = 700) -> str:
+    """Keep both ends of an over-long reply.
+
+    A truncated answer fails at its tail, so a head-only excerpt shows the part
+    that was fine and hides the part that broke.
+    """
+    if len(text) <= limit:
+        return repr(text)
+    half = limit // 2
+    return f"{text[:half]!r} ... [{len(text) - limit} chars omitted] ... {text[-half:]!r}"
 
 
 def _balanced(text: str, opener: str, closer: str) -> str | None:
@@ -151,6 +266,15 @@ def _balanced(text: str, opener: str, closer: str) -> str | None:
     return None
 
 
+def _entries(node: dict) -> list[dict]:
+    """Flatten a mapping into a list of items, keyed-by-id or single-object."""
+    if "category" in node:
+        return [node]
+    return [
+        {**v, "id": v.get("id", k)} for k, v in node.items() if isinstance(v, dict)
+    ]
+
+
 def parse_results(text: str) -> dict[str, ItemResult]:
     """Return {id: ItemResult} for every item that validates.
 
@@ -162,19 +286,20 @@ def parse_results(text: str) -> dict[str, ItemResult]:
 
     if isinstance(data, dict):
         for key in ("results", "emails", "classifications", "items", "data", "output"):
-            if isinstance(data.get(key), list):
-                data = data[key]
+            node = data.get(key)
+            if isinstance(node, list):
+                data = node
+                break
+            if isinstance(node, dict):
+                # `{"results": {"0": {...}, "1": {...}}}` - the envelope is
+                # there but keyed by id rather than listed. Nothing is wrong
+                # with this reply except its shape, so unwrap it rather than
+                # throwing away every item in it.
+                data = _entries(node)
                 break
         else:
             # A single bare object, or an {id: {...}} mapping.
-            if "category" in data:
-                data = [data]
-            else:
-                data = [
-                    {**v, "id": v.get("id", k)}
-                    for k, v in data.items()
-                    if isinstance(v, dict)
-                ]
+            data = _entries(data)
 
     if not isinstance(data, list):
         raise ValueError(f"expected a list of results, got {type(data).__name__}")

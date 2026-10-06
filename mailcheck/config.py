@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import threading
 import tomllib
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import tomli_w
 from platformdirs import user_config_dir, user_data_dir
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 APP_NAME = "mail-check"
 
@@ -33,18 +35,73 @@ def db_path() -> Path:
 
 class LLMConfig(BaseModel):
     base_url: str = ""
-    """OmniRoute base URL, e.g. https://api.omniroute.ai/v1 — no trailing slash needed."""
+    """Ollama server root, e.g. http://192.168.2.230:11440 (no /v1)."""
     model: str = ""
-    batch_size: int = Field(default=8, ge=1, le=32)
+    batch_size: int = Field(default=5, ge=1, le=32)
     max_body_chars: int = Field(default=1200, ge=200, le=20000)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    timeout_seconds: int = Field(default=120, ge=5, le=900)
-    max_retries: int = Field(default=4, ge=1, le=10)
-    """At least 1: `max_retries=0` would mean the request is never even tried."""
-    concurrency: int = Field(default=1, ge=1, le=8)
-    """Free tiers rate-limit hard; 1 is the safe default."""
+    timeout_seconds: int = Field(default=60, ge=5, le=60)
+    classification_deadline_seconds: int = Field(default=300, ge=5, le=300)
+    max_retries: int = Field(default=2, ge=1, le=10)
+    """Legacy values load safely; the client enforces at most two attempts."""
+    concurrency: int = Field(default=1, ge=1, le=1)
+    """One request at a time avoids competing for local model memory."""
     use_json_mode: bool = True
-    """Send response_format=json_object. Disable if the endpoint rejects it."""
+    """Request native Ollama JSON output."""
+    num_ctx: int = Field(default=8192, ge=1024, le=262144)
+    think: bool = False
+    keep_alive: str = "5m"
+
+    @field_validator("timeout_seconds", mode="before")
+    @classmethod
+    def cap_legacy_timeout(cls, value):
+        """Load older 120/300-second configs while enforcing the new bound."""
+        try:
+            return min(int(value), 60)
+        except (TypeError, ValueError):
+            return value
+
+    @field_validator("classification_deadline_seconds", mode="before")
+    @classmethod
+    def cap_legacy_deadline(cls, value):
+        try:
+            return min(int(value), 300)
+        except (TypeError, ValueError):
+            return value
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        return ollama_root(value)
+
+    @field_validator("model")
+    @classmethod
+    def clean_model(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("keep_alive")
+    @classmethod
+    def validate_keep_alive(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"(?:0|\d+(?:\.\d+)?(?:ms|s|m|h))", value):
+            raise ValueError("Use an Ollama keep-alive duration such as 5m, 30s, or 0.")
+        return value
+
+
+def ollama_root(value: str) -> str:
+    """Validate once for both saved settings and directly constructed clients."""
+    value = value.strip().rstrip("/")
+    if not value:
+        return value
+    parts = urlsplit(value)
+    if parts.path or parts.query or parts.fragment:
+        raise ValueError("Use the Ollama server root (e.g. http://192.168.2.230:11440), "
+                         "without /v1 or /api/chat. Migrate the old endpoint in config.toml.")
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+        raise ValueError("Ollama base_url must be an http:// or https:// server root without credentials.")
+    # Accessing port also rejects malformed/non-numeric port values.
+    _ = parts.port
+    return value
 
 
 class CheckConfig(BaseModel):

@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
 from . import db, normalize, prefilter, secrets
 from .config import Config
+from .diagnostics import PerformanceLog
 from .llm import LLMClient, PROMPT_VERSION, classify
 from .models import NormalizedMessage, RunResult, TriagedMessage
 from .sources import IMAPSource, OutlookGraphSource, SourceError
 from .taxonomy import UNCLASSIFIED
 
 StatusFn = Callable[[str], None]
+EventFn = Callable[[dict], None]
 
 
 def _noop(_: str) -> None:
@@ -65,6 +68,7 @@ def check_once(
     use_cache: bool = True,
     status: StatusFn = _noop,
     progress: Callable[[int, int], None] | None = None,
+    event: EventFn | None = None,
 ) -> RunResult:
     result = RunResult(started_at=datetime.now(timezone.utc))
     run_id = db.start_run(conn)
@@ -97,6 +101,7 @@ def check_once(
 
     # ---- fetch (one bad mailbox must not abort the run) -------------------
     fetched: list[NormalizedMessage] = []
+    fetch_started = time.monotonic()
     for account in accounts:
         status(f"Fetching {account.label} ({account.email})...")
         try:
@@ -107,6 +112,7 @@ def check_once(
         fetched.extend(msgs)
         result.accounts_checked += 1
     result.fetched = len(fetched)
+    result.fetch_seconds = time.monotonic() - fetch_started
 
     if not fetched:
         result.finished_at = datetime.now(timezone.utc)
@@ -144,30 +150,20 @@ def check_once(
     # ---- classify --------------------------------------------------------
     if pending:
         status(f"Classifying {len(pending)} email(s) with {cfg.llm.model}...")
-        try:
-            token = secrets.get_llm_token()
-        except secrets.SecretError as exc:
-            result.errors.append(str(exc))
-            result.finished_at = datetime.now(timezone.utc)
-            _finish(conn, run_id, result)
-            return result
-
-        with LLMClient(
-            base_url=cfg.llm.base_url,
-            token=token,
-            model=cfg.llm.model,
-            timeout=cfg.llm.timeout_seconds,
-            max_retries=cfg.llm.max_retries,
-            temperature=cfg.llm.temperature,
-            use_json_mode=cfg.llm.use_json_mode,
-        ) as client:
+        classify_started = time.monotonic()
+        on_event = _event_recorder(result, event, total=len(pending))
+        with LLMClient.from_config(cfg.llm) as client:
             results, errors = classify(
                 client,
                 pending,
                 batch_size=cfg.llm.batch_size,
                 concurrency=cfg.llm.concurrency,
                 progress=progress,
+                classification_deadline_seconds=cfg.llm.classification_deadline_seconds,
+                event=on_event,
+                prepare=getattr(client, "prepare", None),
             )
+        result.classification_seconds = time.monotonic() - classify_started
         result.errors.extend(errors)
 
         for msg, pk, cls in zip(pending, pending_pks, results):
@@ -175,7 +171,10 @@ def check_once(
                 conn, pk, cls, cfg.llm.model, PROMPT_VERSION, commit=False
             )
             result.items.append(TriagedMessage(msg, cls))
-            result.classified += 1
+            if cls.category != UNCLASSIFIED:
+                result.classified += 1
+            if cls.retryable:
+                result.retryable += 1
         conn.commit()
 
     result.items.sort(key=lambda t: t.message.date_utc or datetime.min, reverse=True)
@@ -218,6 +217,7 @@ def reclassify(
     categories: list[str] | None = None,
     status: StatusFn = _noop,
     progress: Callable[[int, int], None] | None = None,
+    event: EventFn | None = None,
 ) -> RunResult:
     """Re-run classification over mail that came back ``unclassified``.
 
@@ -227,10 +227,14 @@ def reclassify(
     only existing escape was ``--no-cache``, which re-bills every message in the
     window to rescue a handful. This retries exactly the ones that failed.
 
-    Batches of one, deliberately: a batch reply that dropped or garbled an item
-    is the usual cause, and re-sending the same batch shape tends to reproduce
-    it. Single-message requests also take the stricter second-pass prompt in
-    ``classify`` when the first attempt still will not parse.
+    Mail that failed because Ollama was busy or unreachable (``retryable``) goes
+    back in normal batches: nothing was wrong with it, and one request per
+    message would make a large backlog take five times as many round trips.
+    Everything else goes one per request, deliberately: a batch reply that
+    dropped or garbled an item is the usual cause, and re-sending the same batch
+    shape tends to reproduce it. Single-message requests also take the stricter
+    second-pass prompt in ``classify`` when the first attempt still will not
+    parse.
     """
     result = RunResult(started_at=datetime.now(timezone.utc))
     run_id = db.start_run(conn)
@@ -259,6 +263,7 @@ def reclassify(
     # A rule the user added since the original run beats another paid call.
     pending: list[NormalizedMessage] = []
     pending_pks: list[int] = []
+    solo: list[int] = []
     for row in rows:
         msg = _row_to_normalized(row)
         rule_hit = prefilter.apply(msg, cfg.prefilter_rules)
@@ -269,36 +274,29 @@ def reclassify(
             result.items.append(TriagedMessage(msg, rule_hit))
             result.prefiltered += 1
             continue
+        if not row["retryable"]:
+            solo.append(len(pending))
         pending.append(msg)
         pending_pks.append(row["pk"])
     conn.commit()
 
     if pending:
         status(f"Re-classifying {len(pending)} email(s) with {cfg.llm.model}...")
-        try:
-            token = secrets.get_llm_token()
-        except secrets.SecretError as exc:
-            result.errors.append(str(exc))
-            result.finished_at = datetime.now(timezone.utc)
-            _finish(conn, run_id, result)
-            return result
-
-        with LLMClient(
-            base_url=cfg.llm.base_url,
-            token=token,
-            model=cfg.llm.model,
-            timeout=cfg.llm.timeout_seconds,
-            max_retries=cfg.llm.max_retries,
-            temperature=cfg.llm.temperature,
-            use_json_mode=cfg.llm.use_json_mode,
-        ) as client:
+        classify_started = time.monotonic()
+        on_event = _event_recorder(result, event, total=len(pending))
+        with LLMClient.from_config(cfg.llm) as client:
             results, errors = classify(
                 client,
                 pending,
-                batch_size=1,
+                batch_size=cfg.llm.batch_size,
                 concurrency=cfg.llm.concurrency,
                 progress=progress,
+                classification_deadline_seconds=cfg.llm.classification_deadline_seconds,
+                event=on_event,
+                prepare=getattr(client, "prepare", None),
+                solo=solo,
             )
+        result.classification_seconds = time.monotonic() - classify_started
         result.errors.extend(errors)
 
         for msg, pk, cls in zip(pending, pending_pks, results):
@@ -308,6 +306,8 @@ def reclassify(
             result.items.append(TriagedMessage(msg, cls))
             if cls.category != UNCLASSIFIED:
                 result.classified += 1
+            if cls.retryable:
+                result.retryable += 1
         conn.commit()
 
     result.items.sort(key=lambda t: t.message.date_utc or datetime.min, reverse=True)
@@ -325,7 +325,49 @@ def _finish(conn: sqlite3.Connection, run_id: int, result: RunResult) -> None:
         classified=result.classified,
         from_cache=result.from_cache,
         errors=result.errors,
+        fetch_seconds=result.fetch_seconds,
+        classification_seconds=result.classification_seconds,
+        llm_requests=result.llm_requests,
+        llm_timeouts=result.llm_timeouts,
+        llm_busy_responses=result.llm_busy_responses,
+        llm_retries=result.llm_retries,
     )
+    try:
+        PerformanceLog().write({
+            "event": "run_summary", "fetch_seconds": result.fetch_seconds,
+            "classification_seconds": result.classification_seconds,
+            "llm_requests": result.llm_requests, "llm_timeouts": result.llm_timeouts,
+            "llm_busy_responses": result.llm_busy_responses,
+            "llm_retries": result.llm_retries, "fetched": result.fetched,
+            "classified": result.classified, "from_cache": result.from_cache,
+            "retryable": result.retryable,
+        })
+    except OSError:
+        pass
+
+
+def _event_recorder(result: RunResult, downstream: EventFn | None, *, total: int) -> EventFn:
+    log = PerformanceLog()
+
+    def record(values: dict) -> None:
+        values = {**values, "total": total}
+        if values.get("type") == "llm_request":
+            raw_attempts = values.get("attempts")
+            attempts = 1 if raw_attempts is None else max(0, int(raw_attempts))
+            result.llm_requests += attempts
+            result.llm_retries += max(0, attempts - 1)
+            if values.get("outcome") == "timeout":
+                result.llm_timeouts += 1
+            if values.get("outcome") == "busy":
+                result.llm_busy_responses += 1
+            try:
+                log.write({"event": "llm_request", **values})
+            except OSError:
+                pass
+        if downstream:
+            downstream(values)
+
+    return record
 
 
 def pk_for(conn: sqlite3.Connection, item: TriagedMessage) -> int | None:

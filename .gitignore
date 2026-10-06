@@ -6,3 +6,8 @@ dist/
 .venv/
 venv/
 .pytest_cache/
+frontend/node_modules/
+.npm-cache/
+
+*.tsbuildinfo
+.pip-cache/

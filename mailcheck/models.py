@@ -57,6 +57,8 @@ class Classification:
     summary: str = ""
     source: str = "llm"
     """``llm`` or ``prefilter``."""
+    retryable: bool = False
+    """Transient Ollama failure; retry on the next ordinary check."""
 
 
 @dataclass
@@ -77,6 +79,13 @@ class RunResult:
     prefiltered: int = 0
     pruned: int = 0
     """Stored messages deleted for ageing out of the retention window."""
+    retryable: int = 0
+    fetch_seconds: float = 0.0
+    classification_seconds: float = 0.0
+    llm_requests: int = 0
+    llm_timeouts: int = 0
+    llm_busy_responses: int = 0
+    llm_retries: int = 0
     items: list[TriagedMessage] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 

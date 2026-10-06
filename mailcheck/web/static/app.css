@@ -189,6 +189,10 @@ a:hover { text-decoration: underline; }
 @keyframes breathe { 50% { opacity: 0.25; } }
 
 main { max-width: 940px; margin: 0 auto; padding: 28px 24px 80px; }
+/* Triage is the one two-pane page; reading width would squeeze both. */
+/* Wider and tighter than a reading page: this one is a workspace, and the
+   space belongs to the two panes rather than to the margins. */
+main.wide { max-width: 1500px; padding: 18px 20px 20px; }
 
 .page-head { margin-bottom: 22px; }
 h1 {
@@ -413,6 +417,53 @@ details.filters[open] > summary::after { content: "▴"; }
 }
 .filter-row select { width: auto; min-width: 0; flex: 0 1 auto; }
 
+
+/* ------------------------------------------------------------- triage head */
+
+/* Everything above the panes, on one line. The headline, the view tabs, the
+   filter disclosure and the shortcut hint were four stacked blocks costing
+   ~155px before any mail appeared — a quarter of a laptop window spent on
+   chrome, on a page whose whole job is the mail underneath it. */
+.triage-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.triage-head h1 {
+  font-size: 21px;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+/* The auto margin goes on the tabs, so everything after them is pushed to the
+   far end — and it stays right whether or not the hint is rendered, which the
+   empty views do not render at all. */
+.triage-head .views {
+  margin: 0 auto 0 0;
+  padding-bottom: 0;
+  overflow: visible;
+}
+.triage-head details.filters { margin-bottom: 0; }
+.triage-head .shortcuts { margin: 0; }
+
+/* Open, the filters take a line of their own rather than squeezing the row. */
+.triage-head details.filters[open] {
+  flex-basis: 100%;
+  margin-left: 0;
+  order: 1;
+}
+
+/* Its own line, under everything: it carries live progress during a check, so
+   it has to be present, but it is the least of what this row is for. */
+.triage-head #status-line {
+  flex-basis: 100%;
+  order: 2;
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
 /* -------------------------------------------------------------- mail cards */
 
 .tier { margin-bottom: 30px; }
@@ -462,7 +513,7 @@ details.filters[open] > summary::after { content: "▴"; }
   transition: transform 0.16s var(--ease), box-shadow 0.16s var(--ease),
     opacity 0.2s var(--ease);
 }
-.mail:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+.mail:hover { background: var(--surface-sunk); }
 .mail.is-done { opacity: 0.6; }
 .mail.leaving {
   opacity: 0;
@@ -526,28 +577,6 @@ details.filters[open] > summary::after { content: "▴"; }
 .mail .when { margin-left: auto; font-size: 12.5px; color: var(--text-3); white-space: nowrap; }
 .mail .summary { margin: 6px 0 0; color: var(--text-2); overflow-wrap: anywhere; }
 
-.actions {
-  margin-top: 12px;
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-.actions .detail { margin-left: auto; }
-
-.mail details > summary {
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--text-2);
-  list-style: none;
-  user-select: none;
-  padding: 5px 4px;
-  border-radius: var(--r-sm);
-}
-.mail details > summary::-webkit-details-marker { display: none; }
-.mail details > summary::after { content: " ▾"; font-size: 10px; }
-.mail details[open] > summary::after { content: " ▴"; }
-.detail-body { margin-top: 8px; }
 .kv {
   display: flex;
   gap: 12px;
@@ -557,18 +586,250 @@ details.filters[open] > summary::after { content: "▴"; }
 }
 .kv > span:first-child { flex: 0 0 88px; color: var(--text-3); }
 .kv > span:last-child { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.mail pre {
-  margin: 10px 0 0;
-  padding: 12px 14px;
-  background: var(--surface-sunk);
-  border-radius: var(--r);
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 320px;
+/* ------------------------------------------------------------- message body */
+
+/* A letter, not a stack trace. The body used to be a 12px monospace block on a
+   sunken panel — code-font prose, paragraph breaks indistinguishable from line
+   wraps, and every link inert. It is the thing you are here to read, so it
+   gets the page's text font, a real reading measure, and working links. */
+.reader-body {
+  flex: 1 1 auto;
+  min-height: 160px;
   overflow: auto;
+  margin-top: 16px;
+  padding-top: 4px;
+  font-size: 14.5px;
+  line-height: 1.62;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.reader-body > :first-child { margin-top: 0; }
+.reader-body p { margin: 0 0 0.85em; }
+.reader-body > :last-child { margin-bottom: 0; }
+
+.reader-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.reader-body ul {
+  margin: 0 0 0.85em;
+  padding-left: 1.25em;
+}
+.reader-body li { margin: 0.2em 0; }
+
+.reader-body hr {
+  height: 1px;
+  margin: 1.1em 0;
+  border: 0;
+  background: var(--separator);
+}
+
+/* A heading html2text carried over from the original markup. */
+.reader-body .rb-head {
+  margin: 1.1em 0 0.4em;
+  font-weight: 640;
+  letter-spacing: -0.01em;
+}
+
+/* An image's alt text, standing alone on a line — and the "no body" note.
+   Present, because it sometimes names the company, but never competing with
+   the words a person actually wrote. */
+.reader-body .rb-alt {
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+/* An address that clean_text shortened past the point of working. Marked as
+   text you cannot follow rather than a link that would fail. */
+.reader-body .rb-dead {
+  color: var(--text-3);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
+}
+
+/* --------------------------------------------------------------- split view */
+
+/* List left, reader right. The two panes scroll independently and each is
+   pinned to the viewport, so arrowing down a hundred emails never moves the
+   reader, and reading a long body never loses your place in the list. */
+.split {
+  display: grid;
+  grid-template-columns: minmax(260px, 380px) 1fr;
+  gap: 18px;
+  align-items: start;
+  /* How tall the panes are. sizePanes() measures this properly once the page
+     has laid out, because how far down the split starts depends on the
+     banners and filters above it. This is only the value used before that
+     runs, and if scripting is off — conservative on purpose, since a pane
+     that is too short merely scrolls, while one that is too tall hangs off
+     the bottom of the window. */
+  --pane-height: max(320px, calc(100vh - 165px));
+}
+.split[hidden] { display: none; }
+
+.mail-list {
+  max-height: var(--pane-height);
+  overflow-y: auto;
+  /* Explicit, because setting only overflow-y makes the other axis `auto` too
+     — and a row on its way out translates 24px to the right, which is enough
+     to flash a horizontal scrollbar for the length of the animation. */
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: 2px 8px 2px 2px;   /* room for the focus ring and the scrollbar */
+  margin: -2px 0;
+}
+.mail-list:focus { outline: none; }
+
+/* The reader borrows `tier` for its accent colours, which also brings that
+   rule's spacing along; inside a grid cell it is just a gap under the pane. */
+.reader.tier { margin-bottom: 0; }
+
+.reader {
+  /* A fixed height, not a maximum: sized to its content, the pane would jump
+     between a three-line rejection and a three-screen thread on every arrow
+     press. The one surface you actually read should hold still. */
+  height: var(--pane-height);
+  /* A column, so the body below can claim whatever height is left over. The
+     pane keeps its own overflow as a safety valve: if an email carries enough
+     metadata to squeeze the body past its floor, the pane scrolls rather than
+     clipping something the reader can never reach. */
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  padding: 20px 22px 24px;
+}
+
+/* The pane keeps the previous email until the next one arrives — dimmed, so
+   it never reads as the current selection. Locally this is a few milliseconds
+   and the transition barely starts; on a slow read it is the honest state. */
+.reader.is-loading { opacity: 0.5; }
+.reader { transition: opacity 0.15s var(--ease); }
+
+/* Everything except the body keeps its natural height. */
+.reader > * { flex: 0 0 auto; }
+
+.reader-placeholder {
+  margin: auto;            /* centred in the empty pane, not stuck at the top */
+  color: var(--text-3);
+  font-size: 14px;
+  padding: 28px 4px;
+  text-align: center;
+}
+
+.reader-head { border-bottom: 1px solid var(--separator); padding-bottom: 14px; }
+.reader-subject {
+  margin: 10px 0 0;
+  font-size: 20px;
+  font-weight: 640;
+  letter-spacing: -0.022em;
+  line-height: 1.28;
+  overflow-wrap: anywhere;
+}
+.reader-from {
+  margin: 5px 0 0;
+  font-size: 13px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.reader .done-flag {
+  padding: 2.5px 9px;
+  border-radius: 980px;
+  background: var(--info-bg);
+  color: var(--info);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.reader .when { margin-left: auto; font-size: 12.5px; color: var(--text-3); white-space: nowrap; }
+.reader .due {
+  padding: 2.5px 9px;
+  border-radius: 980px;
+  background: var(--reply-bg);
+  color: var(--reply);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.reader .due.urgent { background: var(--act-bg); color: var(--act); }
+
+.reader-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.reader-summary {
+  margin: 16px 0 0;
+  font-size: 14.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.reader-meta { margin-top: 14px; }
+
+/* ----------------------------------------------------------------- list rows */
+
+/* A row is a target, not a card: flat, tight, legible at a glance. The
+   selected one is the only thing on the page wearing the accent. */
+.mail { cursor: pointer; scroll-margin: 8px 0; }
+.mail.is-selected {
+  background: var(--accent-sunk, var(--surface-sunk));
+  box-shadow: 0 0 0 1.5px var(--accent) inset, var(--shadow-sm);
+}
+/* Keyboard focus keeps its ring — arrowing through the list is exactly when a
+   focus indicator earns its keep, and the selected tint alone is not one.
+   A mouse click gets the tint without the ring, which is what :focus-visible
+   already decides for us. */
+.mail:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mail:focus:not(:focus-visible) { outline: none; }
+
+/* ----------------------------------------------------------------- shortcuts */
+
+.shortcuts { margin: 14px 2px 0; font-size: 12.5px; color: var(--text-3); }
+.shortcuts[hidden] { display: none; }
+.shortcuts kbd {
+  display: inline-block;
+  min-width: 20px;
+  margin-right: 3px;
+  padding: 1.5px 5px;
+  border: 1px solid var(--separator-hi);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* One column once the two panes genuinely stop fitting.
+
+   Worked out rather than guessed: the reader needs ~340px to be worth reading
+   and the list ~260px, plus an 18px gap and 48px of page padding — so the
+   split still earns its keep down to about 670px. The first version collapsed
+   at 900px, which threw the layout away on any window under half a 1080p
+   screen, including a browser docked in an editor panel. */
+@media (max-width: 700px) {
+  .split { grid-template-columns: 1fr; }
+  .mail-list, .reader {
+    position: static;
+    max-height: none;
+    height: auto;
+    overflow: visible;
+  }
+  .mail-list { padding: 0; margin: 0; }
+}
+
+/* No hover means no pointer, which means no arrow keys either — the hint is
+   not worth the space on a touch screen. */
+@media (hover: none) {
+  .shortcuts { display: none; }
 }
 
 /* ------------------------------------------------------------------ filters */
@@ -908,10 +1169,12 @@ html, body { max-width: 100%; overflow-x: hidden; }
   .mail .who { font-size: 15px; }
   .mail-top { gap: 7px; }
   .mail .when { margin-left: 0; }
-  .actions { gap: 6px; }
-  /* Primary actions stay visible; Details drops below rather than squeezing. */
-  .actions .detail { margin-left: 0; width: 100%; }
-  .actions .btn { flex: 1 1 auto; }
+  /* The reader's actions share the width rather than squeezing, now that
+     there is no Details disclosure competing with them for the row. */
+  .reader-actions { gap: 6px; }
+  .reader-actions .btn { flex: 1 1 auto; }
+  .reader { padding: 16px 14px 20px; }
+  .reader-subject { font-size: 18px; }
   .views a { padding: 6px 11px; font-size: 13px; }
   .kv { flex-direction: column; gap: 0; }
   .kv > span:first-child { flex-basis: auto; }

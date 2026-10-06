@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}mail-check{% endblock %}</title>
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/app.css?v={{ asset_v() }}">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📬</text></svg>">
 </head>
 <body>
@@ -22,6 +22,8 @@
   </span>
 
   <div class="segmented">
+    <a href="/dashboard" class="{{ 'on' if page == 'analytics' }}"
+       {% if page == 'analytics' %}aria-current="page"{% endif %}>Dashboard</a>
     <a href="/" class="{{ 'on' if page == 'triage' }}"
        {% if page == 'triage' %}aria-current="page"{% endif %}>
       Triage{% if urgent_count %}<span class="dot" aria-hidden="true"></span>
@@ -48,14 +50,14 @@
 </script>
 </nav>
 
-<main id="main">
+<main id="main"{% if main_class %} class="{{ main_class }}"{% endif %}>
   {% block content %}{% endblock %}
 </main>
 
 <!-- Routine progress is polite; failures are announced assertively. -->
 <div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 <div id="alerts" role="alert" aria-live="assertive" class="sr-only"></div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v={{ asset_v() }}"></script>
 {% block scripts %}{% endblock %}
 </body>
 </html>
