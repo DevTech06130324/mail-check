@@ -23,6 +23,26 @@ def _noop(_: str) -> None:
     pass
 
 
+#: The model recorded for a result a local rule produced, which no model saw.
+RULE_MODEL = "prefilter"
+
+
+def _prepare(client, status: StatusFn, action: str, count: int) -> Callable[..., None]:
+    """Pick and warm the model before classifying, then say which one it is.
+
+    The model is whatever Ollama has loaded at the time, so its name is only
+    known once ``prepare`` has asked the server.
+    """
+    prepare = getattr(client, "prepare", None)
+
+    def run(**kwargs) -> None:
+        if prepare:
+            prepare(**kwargs)
+        model = getattr(client, "model", "") or "the loaded model"
+        status(f"{action} {count} email(s) with {model}...")
+    return run
+
+
 def build_source(account: db.Account, cfg: Config | None = None):
     """Select the provider adapter. Everything downstream is provider-neutral."""
     if account.provider == "outlook":
@@ -127,7 +147,7 @@ def check_once(
         pk = db.upsert_message(conn, msg)
 
         if use_cache:
-            cached = db.get_cached(conn, pk, cfg.llm.model, PROMPT_VERSION)
+            cached = db.get_cached(conn, pk, PROMPT_VERSION)
             if cached:
                 result.items.append(TriagedMessage(msg, cached, from_cache=True))
                 result.from_cache += 1
@@ -136,7 +156,7 @@ def check_once(
         rule_hit = prefilter.apply(msg, cfg.prefilter_rules)
         if rule_hit:
             db.save_classification(
-                conn, pk, rule_hit, cfg.llm.model, PROMPT_VERSION, commit=False
+                conn, pk, rule_hit, RULE_MODEL, PROMPT_VERSION, commit=False
             )
             result.items.append(TriagedMessage(msg, rule_hit))
             result.prefiltered += 1
@@ -149,10 +169,9 @@ def check_once(
 
     # ---- classify --------------------------------------------------------
     if pending:
-        status(f"Classifying {len(pending)} email(s) with {cfg.llm.model}...")
         classify_started = time.monotonic()
         on_event = _event_recorder(result, event, total=len(pending))
-        with LLMClient.from_config(cfg.llm) as client:
+        with LLMClient.from_config(cfg.llm, fallback_model=db.last_llm_model(conn)) as client:
             results, errors = classify(
                 client,
                 pending,
@@ -161,14 +180,15 @@ def check_once(
                 progress=progress,
                 classification_deadline_seconds=cfg.llm.classification_deadline_seconds,
                 event=on_event,
-                prepare=getattr(client, "prepare", None),
+                prepare=_prepare(client, status, "Classifying", len(pending)),
             )
+            model = getattr(client, "model", "")
         result.classification_seconds = time.monotonic() - classify_started
         result.errors.extend(errors)
 
         for msg, pk, cls in zip(pending, pending_pks, results):
             db.save_classification(
-                conn, pk, cls, cfg.llm.model, PROMPT_VERSION, commit=False
+                conn, pk, cls, model, PROMPT_VERSION, commit=False
             )
             result.items.append(TriagedMessage(msg, cls))
             if cls.category != UNCLASSIFIED:
@@ -269,7 +289,7 @@ def reclassify(
         rule_hit = prefilter.apply(msg, cfg.prefilter_rules)
         if rule_hit:
             db.save_classification(
-                conn, row["pk"], rule_hit, cfg.llm.model, PROMPT_VERSION, commit=False
+                conn, row["pk"], rule_hit, RULE_MODEL, PROMPT_VERSION, commit=False
             )
             result.items.append(TriagedMessage(msg, rule_hit))
             result.prefiltered += 1
@@ -281,10 +301,9 @@ def reclassify(
     conn.commit()
 
     if pending:
-        status(f"Re-classifying {len(pending)} email(s) with {cfg.llm.model}...")
         classify_started = time.monotonic()
         on_event = _event_recorder(result, event, total=len(pending))
-        with LLMClient.from_config(cfg.llm) as client:
+        with LLMClient.from_config(cfg.llm, fallback_model=db.last_llm_model(conn)) as client:
             results, errors = classify(
                 client,
                 pending,
@@ -293,15 +312,16 @@ def reclassify(
                 progress=progress,
                 classification_deadline_seconds=cfg.llm.classification_deadline_seconds,
                 event=on_event,
-                prepare=getattr(client, "prepare", None),
+                prepare=_prepare(client, status, "Re-classifying", len(pending)),
                 solo=solo,
             )
+            model = getattr(client, "model", "")
         result.classification_seconds = time.monotonic() - classify_started
         result.errors.extend(errors)
 
         for msg, pk, cls in zip(pending, pending_pks, results):
             db.save_classification(
-                conn, pk, cls, cfg.llm.model, PROMPT_VERSION, commit=False
+                conn, pk, cls, model, PROMPT_VERSION, commit=False
             )
             result.items.append(TriagedMessage(msg, cls))
             if cls.category != UNCLASSIFIED:

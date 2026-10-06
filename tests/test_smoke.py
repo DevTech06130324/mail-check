@@ -368,12 +368,10 @@ def test_pipeline_and_cache(msgs):
 
         check("upsert is idempotent", db.upsert_message(conn, live[0]) == pks[0])
 
-        cached = db.get_cached(conn, pks[0], "fake-model", "1")
-        check("cache hit on same model+version", cached is not None)
+        cached = db.get_cached(conn, pks[0], "1")
+        check("cache hit on same prompt version", cached is not None)
         check("cache miss on new prompt version",
-              db.get_cached(conn, pks[0], "fake-model", "2") is None)
-        check("cache miss on different model",
-              db.get_cached(conn, pks[0], "other-model", "1") is None)
+              db.get_cached(conn, pks[0], "2") is None)
 
         rows = db.query_triaged(conn)
         check("query returns all rows", len(rows) == len(live), f"{len(rows)}")
@@ -563,7 +561,7 @@ def test_web_console(msgs):
               client.post("/api/check", json={}).status_code == 400)
 
         check("save settings", client.post(
-            "/api/settings", json={"base_url": "http://x", "model": "m", "batch_size": 4}
+            "/api/settings", json={"base_url": "http://x", "batch_size": 4}
         ).json()["ok"])
         check("  settings persisted", cfgmod.load().llm.batch_size == 4)
         check("out-of-range batch_size refused",
@@ -589,10 +587,10 @@ def test_web_console(msgs):
         check("delete missing rule -> 404", client.post("/api/rules/9/delete").status_code == 404)
 
         check("cross-origin POST blocked", client.post(
-            "/api/settings", json={"model": "z"},
+            "/api/settings", json={"batch_size": 4},
             headers={"Origin": "https://evil.example"}).status_code == 403)
         check("same-origin POST allowed", client.post(
-            "/api/settings", json={"model": "z"},
+            "/api/settings", json={"batch_size": 4},
             headers={"Origin": "http://127.0.0.1:8765"}).status_code == 200)
         check("GET unaffected by Origin", client.get(
             "/", headers={"Origin": "https://evil.example"}).status_code == 200)
@@ -1334,7 +1332,7 @@ def test_review_fixes(msgs):
         check("starts unacknowledged", cfg.privacy_ack is False)
 
         client = TestClient(create_app())
-        client.post("/api/settings", json={"model": "some-model"})
+        client.post("/api/settings", json={"batch_size": 4})
         check("an unrelated settings save does not silently acknowledge it",
               cfgmod.load().privacy_ack is False)
 
@@ -1546,13 +1544,12 @@ def test_reclassify(msgs):
 
         # An ordinary check would hand the cached failure straight back.
         check("the failure really is cached (this is the bug being fixed)",
-              db.get_cached(conn, pks[0], "m", "1").category == UNCLASSIFIED)
+              db.get_cached(conn, pks[0], "1").category == UNCLASSIFIED)
 
         cfg = cfgmod.load()
-        cfg.llm.model = "m"
         real_client = pipe.LLMClient
         pipe.LLMClient = type("FakeClientFactory", (), {
-            "from_config": staticmethod(lambda cfg: _FakeLLMContext(FakeLLM("clean")))
+            "from_config": staticmethod(lambda cfg, **_: _FakeLLMContext(FakeLLM("clean")))
         })
         try:
             result = pipe.reclassify(conn, cfg)

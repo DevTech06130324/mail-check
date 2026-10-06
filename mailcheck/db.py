@@ -406,11 +406,18 @@ def prune_messages(conn: sqlite3.Connection, *, before_iso: str) -> int:
 
 
 def get_cached(
-    conn: sqlite3.Connection, message_pk: int, model: str, prompt_version: str
+    conn: sqlite3.Connection, message_pk: int, prompt_version: str
 ) -> Classification | None:
+    """The latest result under this prompt version, whichever model produced it.
+
+    The model is whatever Ollama happens to have loaded, so it changes without
+    the user doing anything; a per-model cache would re-classify every stored
+    message each time it did.
+    """
     row = conn.execute(
-        "SELECT * FROM classifications WHERE message_pk = ? AND model = ? AND prompt_version = ?",
-        (message_pk, model, prompt_version),
+        "SELECT * FROM classifications WHERE message_pk = ? AND prompt_version = ?"
+        " ORDER BY created_at DESC, id DESC LIMIT 1",
+        (message_pk, prompt_version),
     ).fetchone()
     if not row:
         return None
@@ -427,6 +434,20 @@ def get_cached(
         source=row["source"],
         retryable=bool(row["retryable"]),
     )
+
+
+def last_llm_model(conn: sqlite3.Connection) -> str:
+    """The model that most recently classified mail, or "" if none ever has.
+
+    The fallback when Ollama has nothing loaded — typically because its
+    keep-alive expired between checks — so the run reloads it instead of failing.
+    """
+    row = conn.execute(
+        "SELECT model FROM classifications WHERE source = 'llm' AND retryable = 0"
+        " AND category != 'unclassified' AND model != ''"
+        " ORDER BY created_at DESC, id DESC LIMIT 1"
+    ).fetchone()
+    return row["model"] if row else ""
 
 
 def save_classification(

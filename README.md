@@ -41,17 +41,25 @@ python -m mailcheck web
 It opens `127.0.0.1:8765` and walks you through setup if nothing is configured yet.
 Prefer the terminal? The same steps are below.
 
-**1. Point it at your Ollama server.** The model must already be installed on that server:
+**1. Point it at your Ollama server.** There is no model to configure: each check uses
+whichever model the server has loaded:
 
 ```bash
 mail-check init
 # Ollama server URL: http://192.168.2.230:11440
-# Model name:        qwen3.5:35b-a3b
 ```
 
 Use the server root with no `/v1` or API path. mail-check uses Ollama's native
-`POST /api/chat` API without an auth token. `init` sends a JSON health request to test it.
-Generic configuration leaves the URL and model empty until you choose them.
+`POST /api/chat` API without an auth token. `init` sends a JSON health request to test it
+and reports which model answered.
+
+**How the model is chosen.** Before classifying, mail-check asks `GET /api/ps` what is
+loaded and uses the most recently used chat model, skipping embedding-only models
+(checked with `POST /api/show`). Load or switch models on the server (`ollama run <model>`)
+and the next check follows. If nothing is loaded, typically because keep-alive expired
+between checks, it reloads the model that last classified your mail. On a brand-new
+install with nothing loaded, the check defers its mail to the next run and says why.
+Settings → Model shows which model the next check will use.
 
 For this LAN server, start with these settings:
 
@@ -69,10 +77,11 @@ When migrating an existing installation, stop `watch` and pause automatic checks
 An old `/v1` endpoint prevents Settings from loading; recover it from the terminal:
 
 ```bash
-mail-check init --base-url http://192.168.2.230:11440 --model qwen3.5:35b-a3b
+mail-check init --base-url http://192.168.2.230:11440
 ```
 
-This backs up the existing configuration, replaces the endpoint and model, and tests
+This backs up the existing configuration, replaces the endpoint, drops any old `model`
+setting (no longer used), and tests
 the connection. Apply the runtime settings above before restoring your schedule. Mailboxes,
 local rules, privacy acknowledgement, stored messages, and Done states are preserved.
 Old router credentials can remain in the OS keyring; mail-check no longer reads them.
@@ -127,7 +136,7 @@ Three pages, all of it local:
 - **Completed** — what you've marked Done, with Restore.
 - **Accounts** — connect an IMAP mailbox with an app password, or sign in to a personal
   Outlook account with Microsoft. Test, pause, or remove any of them.
-- **Settings** — Ollama server and model; thinking, context, keep-alive, request timeout,
+- **Settings** — Ollama server (the model in use is shown, not chosen); thinking, context, keep-alive, request timeout,
   and classification deadline;
   automatic checks; batch size, concurrency, body length,
   lookback, retention and interval; and local sender rules that label mail before it
@@ -169,9 +178,11 @@ extracted, which is what turns the report into a to-do list.
 
 ## Performance and reliability
 
-Classification is cached in SQLite keyed by `(message_id, model, prompt_version)`, so
-re-running skips inference for cached messages. Changing the model or bumping
-`PROMPT_VERSION` uses fresh classifications on the next check; old cache records remain.
+Classification is cached in SQLite per `(message_id, prompt_version)`, so re-running
+skips inference for cached messages. Each result also records the model that produced it,
+but the cache does not depend on it: the loaded model can change on its own, and that should
+not re-classify everything. Bumping `PROMPT_VERSION` (or `check --no-cache`) uses fresh
+classifications on the next check; old cache records remain.
 
 Emails go to the model **4 per request** by default with bodies stripped of HTML, quoted replies and
 footer boilerplate, then truncated to 1200 characters. Known job-board senders are labelled

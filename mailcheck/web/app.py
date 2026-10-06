@@ -141,7 +141,6 @@ class SettingsBody(BaseModel):
     auto_check: bool | None = None
     outlook_client_id: str | None = None
     base_url: str | None = None
-    model: str | None = None
     num_ctx: int | None = None
     think: bool | None = None
     keep_alive: str | None = None
@@ -1184,7 +1183,7 @@ def create_app() -> FastAPI:
         cfg = cfgmod.load()
         data = cfg.model_dump()
         for field in (
-            "base_url", "model", "batch_size", "max_body_chars", "concurrency",
+            "base_url", "batch_size", "max_body_chars", "concurrency",
             "num_ctx", "think", "keep_alive", "timeout_seconds",
             "classification_deadline_seconds",
         ):
@@ -1219,13 +1218,36 @@ def create_app() -> FastAPI:
 
         cfg = cfgmod.load()
         if not cfg.is_llm_ready():
-            return _err("Set a base URL and model first.")
+            return _err("Set the Ollama server URL first.")
+        with db.session() as conn:
+            fallback = db.last_llm_model(conn)
         try:
-            with LLMClient.from_config(cfg.llm) as client:
+            with LLMClient.from_config(cfg.llm, fallback_model=fallback) as client:
                 reply = client.ping()
         except LLMError as exc:
             return _err(str(exc))
-        return {"ok": True, "message": f"Model replied: {reply.strip()[:120]}"}
+        return {"ok": True, "message": f"{client.model} replied: {reply.strip()[:120]}"}
+
+    @app.get("/api/settings/model")
+    def api_settings_model():
+        """Which model the next check would use, without sending it any work."""
+        from ..llm import LLMClient, LLMError
+
+        cfg = cfgmod.load()
+        if not cfg.is_llm_ready():
+            return {"model": None, "loaded": False, "message": "Set the Ollama server URL first."}
+        with db.session() as conn:
+            fallback = db.last_llm_model(conn)
+        try:
+            with LLMClient.from_config(cfg.llm, fallback_model=fallback) as client:
+                model = client.resolve_model()
+        except LLMError as exc:
+            return {"model": None, "loaded": False, "message": str(exc)}
+        if client.model_loaded:
+            return {"model": model, "loaded": True, "message": "Loaded on the Ollama server."}
+        return {"model": model, "loaded": False,
+                "message": "Nothing is loaded right now; the next check will load this "
+                           "model, the last one that classified your mail."}
 
     @app.post("/api/rules")
     def api_add_rule(body: RuleBody):
