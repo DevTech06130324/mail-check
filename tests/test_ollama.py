@@ -89,7 +89,7 @@ class OllamaTests(unittest.TestCase):
         self.assertEqual(self.client(reply).ping(), '{"ok":true}')
 
     def test_factory_uses_all_config(self):
-        cfg = LLMConfig(base_url="http://ollama", model="qwen", num_ctx=32768,
+        cfg = LLMConfig(base_url="http://ollama", num_ctx=32768,
             think=True, keep_alive="10m", timeout_seconds=60, temperature=0.3, use_json_mode=False)
         with LLMClient.from_config(cfg) as c:
             self.assertEqual(c.num_ctx, 32768)
@@ -109,10 +109,10 @@ class OllamaTests(unittest.TestCase):
              patch.object(cfgmod, "db_path", return_value=Path(tmp)/"mail.db"), \
              patch("keyring.get_password", side_effect=RuntimeError("keyring unavailable")), \
              patch("keyring.set_password", side_effect=RuntimeError("keyring unavailable")):
-            cfg = cfgmod.Config(llm=LLMConfig(base_url="http://ollama", model="qwen"), privacy_ack=True)
+            cfg = cfgmod.Config(llm=LLMConfig(base_url="http://ollama"), privacy_ack=True)
             cfgmod.save(cfg)
             _require_llm(cfg)
-            result = CliRunner().invoke(app, ["init", "--base-url", "http://ollama/", "--model", "qwen", "--no-test"])
+            result = CliRunner().invoke(app, ["init", "--base-url", "http://ollama/", "--no-test"])
             self.assertEqual(result.exit_code, 0, result.output)
             with TestClient(create_app()) as web:
                 self.assertNotIn("Connect a model to start", web.get("/").text)
@@ -156,12 +156,13 @@ class OllamaTests(unittest.TestCase):
             path = cfgmod.config_path()
             original = 'privacy_ack = true\n[llm]\nbase_url = "http://old/v1"\nmodel = "old"\n[watch]\nauto_check = false\ninterval_minutes = 23\n[check]\nretain_days = 19\n'
             path.write_text(original, encoding="utf-8")
-            result = CliRunner().invoke(app, ["init", "--base-url", "http://ollama", "--model", "qwen", "--no-test"])
+            result = CliRunner().invoke(app, ["init", "--base-url", "http://ollama", "--no-test"])
             self.assertEqual(result.exit_code, 0, result.output)
             cfg = cfgmod.load()
             self.assertEqual(cfg.llm.base_url, "http://ollama")
             self.assertEqual(cfg.check.retain_days, 19)
             self.assertEqual(cfg.watch.interval_minutes, 23)
+            self.assertNotIn("model", path.read_text(encoding="utf-8"))
             backups = list(path.parent.glob("config.toml.*.bak"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_text(encoding="utf-8"), original)

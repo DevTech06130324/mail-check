@@ -35,8 +35,12 @@ def db_path() -> Path:
 
 class LLMConfig(BaseModel):
     base_url: str = ""
-    """Ollama server root, e.g. http://192.168.2.230:11440 (no /v1)."""
-    model: str = ""
+    """Ollama server root, e.g. http://192.168.2.230:11440 (no /v1).
+
+    There is deliberately no model setting: each run uses whichever model the
+    server has loaded (``LLMClient.resolve_model``). Older configs that still
+    carry a ``model`` key load fine; pydantic ignores it and the next save drops it.
+    """
     batch_size: int = Field(default=5, ge=1, le=32)
     max_body_chars: int = Field(default=1200, ge=200, le=20000)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -73,11 +77,6 @@ class LLMConfig(BaseModel):
     @classmethod
     def validate_base_url(cls, value: str) -> str:
         return ollama_root(value)
-
-    @field_validator("model")
-    @classmethod
-    def clean_model(cls, value: str) -> str:
-        return value.strip()
 
     @field_validator("keep_alive")
     @classmethod
@@ -173,7 +172,7 @@ class Config(BaseModel):
     """Set once the user has been shown the "bodies leave your machine" notice."""
 
     def is_llm_ready(self) -> bool:
-        return bool(self.llm.base_url and self.llm.model)
+        return bool(self.llm.base_url)
 
 
 #: Parsed config.toml keyed by path, guarded by (mtime_ns, size). The web
@@ -269,7 +268,7 @@ def _strip_none(obj):
 
 
 def set_dotted(cfg: Config, key: str, value: str) -> Config:
-    """Apply ``llm.model=x`` style updates, re-validating through pydantic."""
+    """Apply ``llm.num_ctx=x`` style updates, re-validating through pydantic."""
     data = cfg.model_dump(mode="json")
     parts = key.split(".")
     node = data

@@ -61,20 +61,30 @@ def _root(base_url: str) -> str:
 
 
 class LLMClient:
-    def __init__(self, *, base_url: str, model: str, timeout: int | None = None,
+    def __init__(self, *, base_url: str, model: str = "", fallback_model: str = "",
+                 timeout: int | None = None,
                  timeout_seconds: int | None = None, max_retries: int = 2,
                  temperature: float = 0.0, use_json_mode: bool = True,
                  num_ctx: int = 8192, think: bool = False, keep_alive: str = "5m",
                  load_timeout_seconds: float = 180.0,
                  transport: httpx.BaseTransport | None = None) -> None:
+        """``model`` pins a model; leave it empty to use whatever Ollama has loaded.
+
+        ``fallback_model`` is used only when nothing usable is loaded — normally
+        the model that last classified mail, so an idle server that has unloaded
+        it (keep-alive expired) gets it back rather than failing the run.
+        """
         if not base_url:
             raise LLMError("No base_url configured. Run: mail-check init", category="configuration")
-        if not model:
-            raise LLMError("No model configured. Run: mail-check init", category="configuration")
         root = _root(base_url)
         self.url = f"{root}/api/chat"
         self.ps_url = f"{root}/api/ps"
-        self.model = model
+        self.show_url = f"{root}/api/show"
+        self.model = model.strip()
+        self.fallback_model = fallback_model.strip()
+        #: Set once the model is chosen: True when Ollama already had it loaded,
+        #: False when it is the fallback and the first request will load it.
+        self.model_loaded: bool | None = None
         # This value is attempts, despite the historic name. Never allow more
         # than one retry: more requests amplify an already-busy Ollama queue.
         self.max_retries = max(1, min(max_retries, 2))
@@ -91,8 +101,8 @@ class LLMClient:
         self._client = httpx.Client(timeout=self.timeout_seconds, trust_env=False, transport=transport)
 
     @classmethod
-    def from_config(cls, cfg: LLMConfig) -> "LLMClient":
-        return cls(base_url=cfg.base_url, model=cfg.model,
+    def from_config(cls, cfg: LLMConfig, *, fallback_model: str = "") -> "LLMClient":
+        return cls(base_url=cfg.base_url, fallback_model=fallback_model,
                    timeout_seconds=cfg.timeout_seconds, max_retries=cfg.max_retries,
                    temperature=cfg.temperature, use_json_mode=cfg.use_json_mode,
                    num_ctx=cfg.num_ctx, think=cfg.think, keep_alive=cfg.keep_alive)
@@ -121,8 +131,14 @@ class LLMClient:
         at a usable size, load it once here with the longer load timeout so the
         classification requests only ever see a warm model. If the server
         cannot say what is loaded, do nothing and behave as before.
+
+        With no pinned model, this is also where the model is chosen: the one
+        the server already has loaded (see ``resolve_model``).
         """
-        loaded = self._loaded_context()
+        loaded_models = self._loaded_models()
+        if not self.model:
+            self.model = self._pick(loaded_models)
+        loaded = self._loaded_context(loaded_models)
         if loaded is None:
             return
         if loaded >= self.num_ctx:
@@ -132,19 +148,65 @@ class LLMClient:
             on_loading()
         self._load()
 
-    def _loaded_context(self) -> int | None:
-        """Context length the model is loaded with; 0 when not loaded, None when unknown."""
+    def resolve_model(self) -> str:
+        """The model requests go to: the pinned one, else whichever Ollama has loaded.
+
+        Raises ``OllamaBusy`` when no model can be chosen, so a run defers its
+        mail to the next check instead of failing it.
+        """
+        if not self.model:
+            self.model = self._pick(self._loaded_models())
+        return self.model
+
+    def _loaded_models(self) -> list[dict] | None:
+        """``/api/ps`` entries; None when the server cannot say what is loaded."""
         try:
             resp = self._client.get(self.ps_url, timeout=10)
             resp.raise_for_status()
             models = resp.json().get("models", [])
         except (httpx.HTTPError, ValueError, AttributeError):
             return None
+        if not isinstance(models, list):
+            return None
+        return [m for m in models if isinstance(m, dict)]
+
+    def _pick(self, loaded: list[dict] | None) -> str:
+        # Ollama lists the entry with the most keep-alive left first, which is
+        # the one used most recently — the server's "current" model.
+        for entry in loaded or []:
+            name = entry.get("model") or entry.get("name")
+            if isinstance(name, str) and name and self._can_chat(name):
+                self.model_loaded = True
+                return name
+        if self.fallback_model:
+            self.model_loaded = False
+            return self.fallback_model
+        if loaded is None:
+            raise OllamaBusy(f"Could not ask Ollama at {self.ps_url} which model is loaded",
+                             category="connect")
+        raise OllamaBusy("No model is loaded on the Ollama server. Load one there "
+                         "(for example: ollama run <model>) and check again",
+                         category="no_model")
+
+    def _can_chat(self, name: str) -> bool:
+        """False for embedding-only models, which cannot answer a chat request."""
+        try:
+            resp = self._client.post(self.show_url, json={"model": name}, timeout=10)
+            resp.raise_for_status()
+            capabilities = resp.json().get("capabilities")
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return True
+        return not isinstance(capabilities, list) or "completion" in capabilities
+
+    def _loaded_context(self, models: list[dict] | None) -> int | None:
+        """Context length the model is loaded with; 0 when not loaded, None when unknown."""
+        if models is None:
+            return None
         names = {self.model}
         if ":" not in self.model:
             names.add(f"{self.model}:latest")
-        for entry in models if isinstance(models, list) else []:
-            if isinstance(entry, dict) and names & {entry.get("name"), entry.get("model")}:
+        for entry in models:
+            if names & {entry.get("name"), entry.get("model")}:
                 ctx = entry.get("context_length")
                 return int(ctx) if isinstance(ctx, (int, float)) else 0
         return 0
@@ -172,7 +234,7 @@ class LLMClient:
         if json_mode is None:
             json_mode = self.use_json_mode
         payload: dict = {
-            "model": self.model,
+            "model": self.resolve_model(),
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "options": {"temperature": self.temperature, "num_ctx": self.num_ctx,

@@ -73,10 +73,12 @@ def _require_llm(cfg: cfgmod.Config) -> None:
 @app.command()
 def init(
     base_url: str = typer.Option(None, help="Ollama server root, e.g. http://192.168.2.230:11440"),
-    model: str = typer.Option(None, help="Model name."),
     test: bool = typer.Option(True, help="Send a test request after saving."),
 ) -> None:
-    """Configure the native Ollama endpoint."""
+    """Configure the native Ollama endpoint.
+
+    There is no model to choose: each check uses whichever model the server has loaded.
+    """
     # Apply explicit migration arguments before validation: old /v1 configs
     # cannot otherwise be loaded to replace their endpoint.
     path = cfgmod.config_path()
@@ -87,8 +89,6 @@ def init(
         data = {}
     if base_url is not None:
         data.setdefault("llm", {})["base_url"] = base_url
-    if model is not None:
-        data.setdefault("llm", {})["model"] = model
     try:
         cfg = cfgmod.Config.model_validate(data)
     except ValueError as exc:
@@ -103,7 +103,6 @@ def init(
     cfg.llm.base_url = base_url or Prompt.ask(
         "Ollama server root", default=cfg.llm.base_url or None
     )
-    cfg.llm.model = model or Prompt.ask("Model name", default=cfg.llm.model or None)
     # Revalidate values assigned after loading so init cannot save a /v1 URL.
     try:
         cfg = cfgmod.Config.model_validate(cfg.model_dump())
@@ -125,9 +124,11 @@ def init(
 def _ping(cfg: cfgmod.Config) -> None:
     console.print("Testing endpoint...")
     try:
-        with LLMClient.from_config(cfg.llm) as client:
+        with db.session() as conn:
+            fallback = db.last_llm_model(conn)
+        with LLMClient.from_config(cfg.llm, fallback_model=fallback) as client:
             reply = client.ping()
-        console.print(f"[green]OK[/green] - model replied: [dim]{reply.strip()[:120]}[/dim]")
+        console.print(f"[green]OK[/green] - {client.model} replied: [dim]{reply.strip()[:120]}[/dim]")
     except LLMError as exc:
         console.print(f"[red]Endpoint test failed:[/red] {exc}")
         console.print("[dim]Fix with: mail-check init, or mail-check config set llm.base_url ...[/dim]")

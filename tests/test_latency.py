@@ -236,13 +236,13 @@ class PersistenceAndDiagnosticsTests(unittest.TestCase):
             deferred = Classification(category="unclassified", summary="Ollama busy", retryable=True)
             message_pk = db.upsert_message(conn, message)
             db.save_classification(conn, message_pk, deferred, "model", "v1")
-            self.assertIsNone(db.get_cached(conn, message_pk, "model", "v1"))
+            self.assertIsNone(db.get_cached(conn, message_pk, "v1"))
             stored = conn.execute("SELECT retryable FROM classifications").fetchone()
             self.assertEqual(stored[0], 1)
 
             success = Classification(category="interview", summary="Interview invitation")
             db.save_classification(conn, message_pk, success, "model", "v1")
-            cached = db.get_cached(conn, message_pk, "model", "v1")
+            cached = db.get_cached(conn, message_pk, "v1")
             self.assertEqual(cached.category, "interview")
             self.assertFalse(cached.retryable)
             conn.close()
@@ -418,6 +418,119 @@ class ModelPreparationTests(unittest.TestCase):
         self.assertTrue(all(r.retryable and r.category == "unclassified" for r in results))
         self.assertEqual(len(errors), 1)
 
+
+_EMBEDDER = {"name": "nomic-embed-text:latest", "model": "nomic-embed-text:latest",
+             "context_length": 2048}
+
+
+class ModelResolutionTests(unittest.TestCase):
+    """No model is configured: each run uses whatever the server has loaded."""
+
+    def _client(self, handler, **kwargs) -> LLMClient:
+        return LLMClient(base_url="http://ollama.test:11434", timeout_seconds=60,
+                         num_ctx=8192, transport=httpx.MockTransport(handler), **kwargs)
+
+    @staticmethod
+    def _handler(models, capabilities=None, seen=None):
+        capabilities = capabilities or {}
+
+        def handler(request):
+            if seen is not None:
+                seen.append(request.url.path)
+            if request.url.path == "/api/ps":
+                return _ps(models)
+            if request.url.path == "/api/show":
+                name = json.loads(request.content)["model"]
+                return httpx.Response(200, json={"capabilities": capabilities.get(name, ["completion"])})
+            return httpx.Response(200, json={"message": {"content": "{}"}, "done": True})
+        return handler
+
+    def test_uses_the_loaded_model(self) -> None:
+        with self._client(self._handler([_LOADED])) as client:
+            client.prepare()
+        self.assertEqual(client.model, "qwen3.5:35b-a3b")
+        self.assertTrue(client.model_loaded)
+        self.assertEqual(client.num_ctx, 32768)
+
+    def test_skips_embedding_models(self) -> None:
+        handler = self._handler([_EMBEDDER, _LOADED],
+                                {"nomic-embed-text:latest": ["embedding"]})
+        with self._client(handler) as client:
+            self.assertEqual(client.resolve_model(), "qwen3.5:35b-a3b")
+
+    def test_falls_back_to_the_last_model_and_loads_it(self) -> None:
+        seen: list[str] = []
+        handler = self._handler([], seen=seen)
+        with self._client(handler, fallback_model="gemma4:e4b") as client:
+            client.prepare()
+        self.assertEqual(client.model, "gemma4:e4b")
+        self.assertFalse(client.model_loaded)
+        self.assertEqual(seen, ["/api/ps", "/api/chat"])
+
+    def test_loaded_model_beats_the_fallback(self) -> None:
+        with self._client(self._handler([_LOADED]), fallback_model="gemma4:e4b") as client:
+            self.assertEqual(client.resolve_model(), "qwen3.5:35b-a3b")
+
+    def test_nothing_loaded_and_no_fallback_defers_the_run(self) -> None:
+        handler = self._handler([_EMBEDDER], {"nomic-embed-text:latest": ["embedding"]})
+        with self._client(handler) as client:
+            with self.assertRaises(OllamaBusy) as raised:
+                client.prepare()
+            self.assertEqual(raised.exception.category, "no_model")
+            results, errors = classify(client, [_message(0)], prepare=client.prepare)
+        self.assertTrue(results[0].retryable)
+        self.assertIn("no model loaded", results[0].summary)
+        self.assertEqual(len(errors), 1)
+
+    def test_unreachable_server_without_fallback_is_busy(self) -> None:
+        def handler(request):
+            raise httpx.ConnectError("refused", request=request)
+
+        with self._client(handler) as client:
+            with self.assertRaises(OllamaBusy) as raised:
+                client.resolve_model()
+        self.assertEqual(raised.exception.category, "connect")
+
+    def test_complete_resolves_without_prepare(self) -> None:
+        bodies: list[dict] = []
+        inner = self._handler([_LOADED])
+
+        def handler(request):
+            if request.url.path == "/api/chat":
+                bodies.append(json.loads(request.content))
+            return inner(request)
+
+        with self._client(handler) as client:
+            client.complete("s", "u")
+        self.assertEqual(bodies[0]["model"], "qwen3.5:35b-a3b")
+
+    def test_a_pinned_model_never_asks_for_capabilities(self) -> None:
+        seen: list[str] = []
+        with self._client(self._handler([_LOADED], seen=seen), model="pinned:1b") as client:
+            client.prepare()
+        self.assertEqual(client.model, "pinned:1b")
+        self.assertNotIn("/api/show", seen)
+
+    def test_last_llm_model_ignores_rules_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = db.connect(Path(tmp) / "mail.db")
+            self.assertEqual(db.last_llm_model(conn), "")
+            account_id = db.add_account(conn, label="mail", email="u@example.com",
+                                        imap_host="imap.example.com", imap_port=993, use_ssl=True)
+            message = _message(1)
+            message.account_id = account_id
+            pk = db.upsert_message(conn, message)
+            db.save_classification(conn, pk, Classification(category="interview"), "good:7b", "v1")
+            db.save_classification(conn, pk, Classification(category="job_alert", source="prefilter"),
+                                   "prefilter", "v1")
+            db.save_classification(conn, pk, Classification(category="unclassified", retryable=True),
+                                   "broken:1b", "v1")
+            self.assertEqual(db.last_llm_model(conn), "good:7b")
+            # The cache follows the newest result, whichever model produced it.
+            db.save_classification(conn, pk, Classification(category="rejection"), "other:3b", "v1")
+            self.assertEqual(db.get_cached(conn, pk, "v1").category, "rejection")
+            conn.close()
+
     def test_classify_reports_loading_through_the_event_hook(self) -> None:
         events: list[dict] = []
 
@@ -476,7 +589,7 @@ class ReclassifyBatchingTests(unittest.TestCase):
 
         class Factory:
             @staticmethod
-            def from_config(_cfg):
+            def from_config(_cfg, **_kwargs):
                 class Ctx:
                     def __enter__(self):
                         return object()

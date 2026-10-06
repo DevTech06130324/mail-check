@@ -193,8 +193,9 @@ def classify(client: LLMClient, messages: list[NormalizedMessage], *, batch_size
         try:
             prepare(on_loading=(lambda: event({"type": "model_loading"})) if event else None)
         except OllamaBusy as exc:
-            return ([_unclassified("Ollama busy; retry next check", retryable=True)
-                     for _ in messages],
+            reason = ("no model loaded in Ollama; retry next check"
+                      if exc.category == "no_model" else "Ollama busy; retry next check")
+            return ([_unclassified(reason, retryable=True) for _ in messages],
                     [f"{exc}. All of this mail will retry next check."])
     width = max(1, batch_size)
     solo_set = set(solo)

@@ -20,8 +20,9 @@
       <div class="hint">Enter the server root, with no <code>/v1</code> or API path.</div>
     </div>
     <div class="field">
-      <label for="s-model">Model</label>
-      <input type="text" id="s-model" value="{{ cfg.llm.model }}" placeholder="qwen3.5:35b-a3b">
+      <label>Model</label>
+      <div class="hint">Detected automatically: each check uses whichever model is loaded
+        on the Ollama server. Test connection shows which one that is.</div>
     </div>
     <div class="field">
       <label for="s-think">
@@ -347,7 +348,6 @@ function settingsBody() {
   };
   const body = {
     base_url: document.getElementById("s-base").value.trim(),
-    model: document.getElementById("s-model").value.trim(),
     think: document.getElementById("s-think").checked,
     num_ctx: num("s-context"),
     timeout_seconds: num("s-timeout"),

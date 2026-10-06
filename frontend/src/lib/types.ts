@@ -26,7 +26,7 @@ export type Bootstrap = {
   last_run: string; account_count: number
 }
 export type Settings = {
-  llm: { base_url: string; model: string; batch_size: number; max_body_chars: number; timeout_seconds: number; classification_deadline_seconds: number; concurrency: number; num_ctx: number; think: boolean; keep_alive: string }
+  llm: { base_url: string; batch_size: number; max_body_chars: number; timeout_seconds: number; classification_deadline_seconds: number; concurrency: number; num_ctx: number; think: boolean; keep_alive: string }
   check: { lookback_days: number; retain_days: number }
   watch: { interval_minutes: number; auto_check: boolean }
   outlook: { client_id: string }; privacy_ack: boolean
